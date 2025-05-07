@@ -3,6 +3,7 @@ const bodyParser = require("body-parser");
 const { Client } = require("@notionhq/client"); // Import Notion Client
 const OpenAI = require("openai"); // Import OpenAI Client
 const { WebClient } = require("@slack/web-api"); // Import Slack WebClient
+const crypto = require("crypto"); // Needed for signature verification
 
 const app = express();
 
@@ -92,7 +93,26 @@ if (!SLACK_BOT_TOKEN || !SLACK_SIGNING_SECRET || !NOTION_API_KEY) {
   );
 }
 
+// General JSON body parser for most routes
 app.use(bodyParser.json());
+
+// Specific urlencoded parser for the Slack interactive endpoint, with raw body capture
+const urlencodedParserForInteractive = bodyParser.urlencoded({
+  extended: true,
+  limit: "5mb",
+  verify: (req, res, buf, encoding) => {
+    try {
+      req.rawBody = buf.toString(encoding || "utf8");
+      logger.info(
+        "[bodyParser verify] Raw body captured for Slack interactive endpoint signature verification."
+      );
+    } catch (e) {
+      logger.error("[bodyParser verify] Error capturing rawBody:", e);
+      // You might want to throw an error here or handle it, so verifySlackSignature doesn't use a missing/stale req.rawBody
+      // For now, log and continue; verifySlackSignature should ideally check if req.rawBody exists.
+    }
+  },
+});
 
 // --- Mock Data Stores (In-memory for demo) ---
 let notionPages = {}; // Store mock Notion pages: { "slack_permalink_id": { pageId: "...", url: "..." } }
@@ -188,18 +208,24 @@ const tools_slack = {
       permalink: permalink,
     };
   },
-  postSlackReply_tool: async ({ channelId, messageText, threadTimestamp }) => {
+  postSlackReply_tool: async ({
+    channelId,
+    messageText,
+    threadTimestamp,
+    blocks,
+  }) => {
     logger.tool(
       "Slack",
       `postSlackReply_tool: Replying to channel ${channelId} (Thread: ${
         threadTimestamp || "N/A"
-      }): "${messageText}"`
+      }): \"${messageText}\"${blocks ? " with blocks" : ""}`
     );
     if (slackWebClient) {
       try {
         const result = await slackWebClient.chat.postMessage({
           channel: channelId,
-          text: messageText,
+          text: messageText, // Pass the fallback text
+          blocks: blocks, // Pass the blocks if they exist
           thread_ts: threadTimestamp,
         });
         return {
@@ -224,6 +250,7 @@ const tools_slack = {
         messageId: `slack_reply_ts_${Date.now()}`,
         channel: channelId,
         text: messageText,
+        blocks: blocks, // Include blocks in mock response if provided
       };
     }
   },
@@ -389,59 +416,57 @@ const tools_processing = {
     };
 
     if (openai) {
-      const prompt = `You are an expert issue triage assistant. Read the Slack message below and extract structured data for a Notion issue tracker. Output a JSON object with these keys:
+      const prompt = `You are an expert issue triage assistant. Your task is to analyze a Slack message and extract structured information for creating an issue in a Notion tracker. Output a valid JSON object with the following keys:
 
-Title: A concise summary of the main problem or request. If unclear, use "UNKNOWN_TITLE". Use sentence case.
-Description: The full original Slack message.
-RootCause: If the message gives a root cause, extract it. If the message says the root cause is unknown/unclear/unsure, set to "Unclear". If not mentioned at all, set to "UNKNOWN_ROOT_CAUSE". If the user explicitly states "N/A", use "N/A".
-IssueType: One of Bug, Incident, Task, Test. If not clearly inferable, use "UNKNOWN_ISSUE_TYPE".
-Priority: One of High, Medium, Low. If not clearly inferable, use "UNKNOWN_PRIORITY".
-SuccessCriteria: If the message specifies what success looks like, extract it. If not mentioned, set to "UNKNOWN_SUCCESS_CRITERIA". If the user explicitly states "N/A", use "N/A".
-Resolution: If the message specifies a resolution, extract it. If not mentioned, set to "UNKNOWN_RESOLUTION". If the user explicitly states "N/A", use "N/A".
-PictureURL: If there is an attachment, use its URL. Otherwise, "No picture attached".
-originalText: The raw Slack message.
+- Title: (String) A concise summary of the main problem or request, typically 5-15 words. If a clear title cannot be derived, use "UNKNOWN_TITLE". Sentence case.
+- Description: (String) The full, verbatim text of the original Slack message. This will be used as the primary description content.
+- RootCause: (String) If the message explicitly mentions a root cause, extract it. If the user states the root cause is unknown, unclear, or similar, use "Unclear". If not mentioned at all, use "UNKNOWN_ROOT_CAUSE". If the user explicitly states "N/A", use "N/A".
+- IssueType: (String) Categorize into one of: "Bug", "Incident", "Task", "Test". If not clearly inferable from the message content, use "UNKNOWN_ISSUE_TYPE".
+- Priority: (String) Categorize into one of: "High", "Medium", "Low". If not clearly inferable, use "UNKNOWN_PRIORITY".
+- SuccessCriteria: (String) If the message specifies success criteria or definition of done, extract it. If not mentioned, use "UNKNOWN_SUCCESS_CRITERIA". If the user explicitly states "N/A", use "N/A".
+- Resolution: (String) If the message specifies a resolution or fix, extract it. If not mentioned, use "UNKNOWN_RESOLUTION". If the user explicitly states "N/A", use "N/A".
+- MentionedImageURL: (String) If the user pastes a URL to an image directly in the message text, extract that URL. Otherwise, use "NO_MENTIONED_IMAGE_URL". (Note: Actual attached files are handled separately by the system).
 
-IMPORTANT: Do NOT default to values like "Medium" for Priority or "Task" for IssueType if you are unsure. Use the "UNKNOWN_" variants.
+IMPORTANT:
+- Adhere strictly to the specified values for "UNKNOWN_*" or "NO_MENTIONED_IMAGE_URL" when information is not available or applicable. Do not invent information.
+- The output MUST be a single, valid JSON object and nothing else.
 
 Examples:
 1. Slack Message: "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module"
    Output:
    {
-     "Title": "Cannot get the valve to open on the adsorb side of the module",
+     "Title": "Cannot get valve to open on adsorb side of module",
      "Description": "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module",
-     "RootCause": "Unclear",
+     "RootCause": "UNKNOWN_ROOT_CAUSE", 
      "IssueType": "Bug",
      "Priority": "High",
      "SuccessCriteria": "UNKNOWN_SUCCESS_CRITERIA",
      "Resolution": "UNKNOWN_RESOLUTION",
-     "PictureURL": "No picture attached",
-     "originalText": "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module"
+     "MentionedImageURL": "NO_MENTIONED_IMAGE_URL"
    }
-2. Slack Message: "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment."
+2. Slack Message: "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment. See screenshot at http://example.com/login_error.png"
    Output:
    {
      "Title": "Login page down for all users",
-     "Description": "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment.",
+     "Description": "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment. See screenshot at http://example.com/login_error.png",
      "RootCause": "Database migration failed.",
      "IssueType": "Incident",
      "Priority": "High",
      "SuccessCriteria": "Users can log in again.",
      "Resolution": "Rolled back the faulty deployment.",
-     "PictureURL": "No picture attached",
-     "originalText": "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment."
+     "MentionedImageURL": "http://example.com/login_error.png"
    }
-3. Slack Message: "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now."
+3. Slack Message: "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now. Root cause is totally unknown."
     Output:
     {
       "Title": "Pump is making a weird noise",
-      "Description": "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now.",
-      "RootCause": "UNKNOWN_ROOT_CAUSE",
+      "Description": "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now. Root cause is totally unknown.",
+      "RootCause": "Unclear",
       "IssueType": "Bug",
       "Priority": "UNKNOWN_PRIORITY",
       "SuccessCriteria": "N/A",
       "Resolution": "Fixed by restarting the controller.",
-      "PictureURL": "No picture attached",
-      "originalText": "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now."
+      "MentionedImageURL": "NO_MENTIONED_IMAGE_URL"
     }
 4. Slack Message: "Need to order more coffee."
     Output:
@@ -453,14 +478,14 @@ Examples:
         "Priority": "UNKNOWN_PRIORITY",
         "SuccessCriteria": "UNKNOWN_SUCCESS_CRITERIA",
         "Resolution": "UNKNOWN_RESOLUTION",
-        "PictureURL": "No picture attached",
-        "originalText": "Need to order more coffee."
+        "MentionedImageURL": "NO_MENTIONED_IMAGE_URL"
    }
 
-Slack Message:
+Slack Message to parse:
 ${rawSlackText}
 
-Return ONLY valid JSON.`;
+JSON Output:
+`;
 
       try {
         const response = await openai.chat.completions.create({
@@ -569,23 +594,34 @@ Return ONLY valid JSON.`;
     }
 
     const questionList = questionsAsked
-      .map((q) => `- ${q.displayName}: ${q.question}`)
+      .map((q) => `- ${q.displayName} (${q.parsedKey}): ${q.question}`)
       .join("\n");
     const originalJson = JSON.stringify(originalParsedInfo, null, 2);
 
-    const prompt = `You are updating issue details based on a user's reply. The original parsed information was:
+    const prompt = `You are an AI assistant tasked with updating a JSON object containing issue details. You will be given the original JSON object, a list of specific fields the user was asked to clarify, and the user's reply.
+
+Your goal is to update the JSON object based *only* on the information the user provided in their reply *for the fields they were asked about*.
+
+Here is the original JSON data:
 \`\`\`json
 ${originalJson}
 \`\`\`
 
-The user was asked to clarify the following fields based on these questions:
-${questionList}
+The user was asked to provide information for the following fields (internal JSON key name is in parentheses):
+${questionList} 
+// Example format for questionList items: "- Success Criteria (SuccessCriteria): What are the success criteria...?"
 
-Their reply is: "${userReplyText}"
+The user's reply is: "${userReplyText}"
 
-Update the original JSON data based *only* on the information provided in the user's reply regarding the fields asked about. Preserve the original values for fields that were *not* asked about. If the user's reply doesn't clearly answer a specific question asked, keep the original value (which might be an 'UNKNOWN_' placeholder) for that field. 
+Instructions for updating the JSON:
+1.  For each field the user was asked about:
+    a.  If the user's reply provides a clear and direct answer for that specific field, update the value of the corresponding key in the JSON object.
+    b.  If the user's reply does *not* provide a clear answer for that specific asked field, or if they indicate they don't know or it's N/A (and the original value wasn't already "N/A" or similar), retain the original value for that key from the provided JSON (it might be an "UNKNOWN_*" placeholder, an existing value, or "N/A").
+2.  For any fields in the original JSON object that the user was *not* asked about in this round, their values MUST remain unchanged. Do not infer or update these fields.
+3.  Ensure the entire, updated JSON object is returned.
 
-Output the complete, updated JSON object. Ensure the output is ONLY the valid JSON object.`;
+Output ONLY the complete, updated, valid JSON object. Do not include any other text or explanations.
+`;
 
     try {
       const response = await openai.chat.completions.create({
@@ -688,26 +724,34 @@ app.post("/tools/notion/createPage", async (req, res) => {
 });
 
 // --- II. MCP Client: Orchestration Logic ---
-// This endpoint simulates a Slack Event API webhook.
-// IMPORTANT: Real Slack webhooks should be verified using SLACK_SIGNING_SECRET.
+
+// Endpoint for Slack Events API (Messages, etc.)
 app.post("/webhook/slack/event", async (req, res) => {
-  logger.info("\n--- [MCP CLIENT LOG] Received Slack Event Webhook ---");
   const slackEventPayload = req.body;
+  // logger.debug(\`[RAW SLACK EVENT] ${JSON.stringify(slackEventPayload)}\`); // Very verbose
 
-  // TODO: Add Slack request verification using SLACK_SIGNING_SECRET
-  // const { verifyRequestSignature } = require('@slack/events-api');
-  // verifyRequestSignature({
-  //   signingSecret: SLACK_SIGNING_SECRET,
-  //   requestSignature: req.headers['x-slack-signature'],
-  //   requestTimestamp: req.headers['x-slack-request-timestamp'],
-  //   body: req.rawBody // Requires raw body parser middleware
-  // });
+  // Basic validation and type check
+  if (!slackEventPayload || typeof slackEventPayload !== "object") {
+    logger.warn("[MCP CLIENT LOG] Invalid or empty payload received.");
+    return res.status(400).send("Invalid payload.");
+  }
 
+  // Slack URL Verification Challenge
+  // (Handle this early and separately)
+  if (slackEventPayload.type === "url_verification") {
+    logger.info(
+      "[MCP CLIENT LOG] Responding to Slack URL verification challenge."
+    );
+    return res.status(200).send(slackEventPayload.challenge);
+  }
+
+  // We only care about event_callback carrying a message event
   if (
     slackEventPayload.type === "event_callback" &&
     slackEventPayload.event &&
     slackEventPayload.event.type === "message"
   ) {
+    // Filter out messages from bots (including our own), or message changes/deletions
     if (
       slackEventPayload.event.bot_id ||
       slackEventPayload.event.subtype === "bot_message" ||
@@ -717,264 +761,157 @@ app.post("/webhook/slack/event", async (req, res) => {
       logger.info(
         `[MCP CLIENT LOG] Ignoring event with subtype: ${
           slackEventPayload.event.subtype || "bot_id event"
-        }.`
+        }`
       );
       return res.status(200).send("Ignoring event due to subtype.");
     }
 
     const messagePayload = slackEventPayload.event;
+    // Use the thread_ts if available (message is in a thread), otherwise use the message's own ts.
+    // This contextIdentifier will key the pending interaction.
+    const contextIdentifier = messagePayload.thread_ts || messagePayload.ts;
 
-    // --- Check if this is a reply to a tracked thread ---
-    if (
-      messagePayload.thread_ts &&
-      pendingInteractions[messagePayload.thread_ts]
-    ) {
-      const interactionState = pendingInteractions[messagePayload.thread_ts];
-      const originalMessageTs = messagePayload.thread_ts; // For clarity
+    logger.info(
+      `[MCP CLIENT LOG] Processing message event for context: ${contextIdentifier} (Message TS: ${messagePayload.ts}, Thread TS: ${messagePayload.thread_ts})`
+    );
+
+    // Acknowledge Slack immediately BEFORE any lengthy processing
+    // Important: Only send response once. Subsequent logic should not try to res.send/json.
+    res.status(200).json({ message: "Event received, processing..." });
+
+    // --- Check if this message is part of an ongoing interaction context ---
+    if (pendingInteractions[contextIdentifier]) {
+      const interactionState = pendingInteractions[contextIdentifier];
       logger.info(
-        `[MCP CLIENT LOG] Received reply for tracked thread: ${originalMessageTs}`
+        `[MCP CLIENT LOG] Received reply for tracked context: ${contextIdentifier}`
       );
 
-      // Acknowledge Slack immediately before processing
-      res.status(200).json({ message: "Reply received, processing..." });
-
       try {
-        // --- Phase 2 - Step 6: Process User's Answers ---
         const userReplyText = messagePayload.text;
-        logger.info(`[MCP CLIENT LOG] Processing reply: "${userReplyText}"`);
+        logger.info(
+          `[MCP CLIENT LOG] Processing reply: "${userReplyText}" for context ${contextIdentifier}`
+        );
 
-        const updatedParsedInfoRaw =
+        // Update the parsed info with the user's new answers
+        const originalDataBeforeUpdate = interactionState.initialParsedInfoRaw; // Store ref before call
+        const updatedData = // Use a temp var for the returned data
           await tools_processing.parseAnswersAndUpdate_tool({
             userReplyText: userReplyText,
-            originalParsedInfo: interactionState.initialParsedInfoRaw,
+            originalParsedInfo: originalDataBeforeUpdate,
             questionsAsked: interactionState.missingInfo,
           });
 
-        logger.info(
-          "[MCP CLIENT LOG] Step 2 Updated: Parsed Issue Info (Raw) after reply:",
-          updatedParsedInfoRaw
-        );
-
-        // TODO: Optional: Re-evaluate gaps based on updatedParsedInfoRaw. For now, assume one round is enough.
-        // We will now proceed to Notion creation using the updated info.
-
-        // --- Continue workflow from Step 2.5 using UPDATED info ---
-        const structuredSlackMessage = interactionState.structuredSlackMessage; // Get original message details
-        const normalizedPermalink = canonicalizeSlackPermalink(
-          structuredSlackMessage.permalink
-        );
-
-        // Normalize based on the *updated* raw info
-        const issueTitle =
-          updatedParsedInfoRaw.Title !== "UNKNOWN_TITLE"
-            ? updatedParsedInfoRaw.Title || "Untitled Issue"
-            : "Untitled Issue";
-        const issueDescription =
-          updatedParsedInfoRaw.Description ||
-          updatedParsedInfoRaw.originalText ||
-          "";
-        const issueRootCause =
-          updatedParsedInfoRaw.RootCause !== "UNKNOWN_ROOT_CAUSE"
-            ? updatedParsedInfoRaw.RootCause || "N/A"
-            : "N/A";
-        const issuePictureUrl =
-          updatedParsedInfoRaw.PictureURL || "No picture attached";
-        const issueType =
-          updatedParsedInfoRaw.IssueType !== "UNKNOWN_ISSUE_TYPE"
-            ? updatedParsedInfoRaw.IssueType || "Task"
-            : "Task";
-        const issuePriority =
-          updatedParsedInfoRaw.Priority !== "UNKNOWN_PRIORITY"
-            ? updatedParsedInfoRaw.Priority || "Medium"
-            : "Medium";
-        const issueSuccessCriteria =
-          updatedParsedInfoRaw.SuccessCriteria !== "UNKNOWN_SUCCESS_CRITERIA"
-            ? updatedParsedInfoRaw.SuccessCriteria || "N/A"
-            : "N/A";
-        const issueResolution =
-          updatedParsedInfoRaw.Resolution !== "UNKNOWN_RESOLUTION"
-            ? updatedParsedInfoRaw.Resolution || ""
-            : "";
-
-        const currentIssueDataForTriage = {
-          Title: issueTitle,
-          Description: issueDescription,
-          "Root Cause": issueRootCause,
-          "Issue Type": issueType,
-          Priority: issuePriority,
-          "Success Criteria": issueSuccessCriteria,
-          "Picture URL": issuePictureUrl,
-          Resolution: issueResolution,
-          originalText: updatedParsedInfoRaw.originalText,
-        };
-
-        logger.info(
-          "[MCP CLIENT LOG] Step 2.5 Updated: Data for Triage (Post-Reply & Normalization):",
-          currentIssueDataForTriage
-        );
-
-        const triageDetails =
-          await tools_processing.determineTriageCategory_tool({
-            structuredIssueData: currentIssueDataForTriage,
-          });
-        logger.info(
-          "[MCP CLIENT LOG] Step 3 Updated: Triage Details:",
-          triageDetails
-        );
-
-        const existingNotionPage =
-          await tools_notion.findNotionPageBySlackLink_tool({
-            slackMessagePermalink: normalizedPermalink,
-          });
-        logger.info(
-          "[MCP CLIENT LOG] Step 4 Updated: Existing Notion Page Check:",
-          existingNotionPage
-        );
-
-        let notionPageDetails;
-        if (existingNotionPage) {
-          logger.info(
-            `[MCP CLIENT LOG] Issue already logged in Notion: ${existingNotionPage.url}. Consider implementing update logic.`
+        // Check if the LLM tool failed (returned the exact same object reference)
+        if (
+          updatedData === originalDataBeforeUpdate &&
+          userReplyText.trim() !== ""
+        ) {
+          logger.warn(
+            `[MCP CLIENT LOG] parseAnswersAndUpdate_tool returned original data for context ${contextIdentifier}. User reply might not have been processed due to LLM error.`
           );
-          notionPageDetails = existingNotionPage;
-          // TODO: Optionally update existing page here
-        } else {
-          let resolutionContentForNotion = issueResolution;
-          const pageProperties = {
-            Title: { title: [{ text: { content: issueTitle } }] },
-            Type: { select: { name: issueType } },
-            Priority: { multi_select: [{ name: issuePriority }] },
-            Status: { status: { name: "Triage" } },
-            "Success Criteria": {
-              rich_text: [{ text: { content: issueSuccessCriteria } }],
-            },
-            "Resolution TL'DR": {
-              rich_text: [{ text: { content: resolutionContentForNotion } }],
-            },
-            "Root Cause": {
-              rich_text: [{ text: { content: issueRootCause } }],
-            },
-            "Link to Slack Message": { url: normalizedPermalink },
-            "Date Identified": {
-              date: {
-                start: new Date(
-                  parseFloat(structuredSlackMessage.timestamp) * 1000
-                ).toISOString(),
-              },
-            },
-            Reporter: { people: [] },
-            Assigned: { people: [] },
-            Sprint: { relation: [] },
-            Due: { date: null },
-            "Program/Project": { relation: [] },
-            "⏰ Versions": { relation: [] },
-            Tags: { multi_select: [] },
-            "Parent-task": { relation: [] },
-            "Sub-tasks": { relation: [] },
-            "Task ID": { rich_text: [{ text: { content: "N/A" } }] },
-            "Mid-sprint task": { checkbox: false },
-            "Est. Hours": { number: null },
-          };
-
-          // Add Files property if attachments exist
-          if (
-            structuredSlackMessage.attachments &&
-            structuredSlackMessage.attachments.length > 0
-          ) {
-            pageProperties["Files"] = {
-              files: structuredSlackMessage.attachments
-                .map((file) => ({
-                  name: file.name || file.title || "Slack Attachment",
-                  type: "external",
-                  external: {
-                    url: file.permalink,
-                  },
-                }))
-                .filter((f) => f.external.url), // Ensure we only add files with a permalink
-            };
-            // Limit to a reasonable number if necessary (e.g., Notion API limits)
-            if (pageProperties["Files"].files.length > 10) {
-              logger.warn(
-                `[Notion Files] More than 10 attachments found, only linking the first 10.`
-              );
-              pageProperties["Files"].files = pageProperties[
-                "Files"
-              ].files.slice(0, 10);
-            }
-            // Remove the property if no valid files were found after filtering
-            if (pageProperties["Files"].files.length === 0) {
-              delete pageProperties["Files"];
-            }
-          }
-
-          notionPageDetails = await tools_notion.createNotionPage_tool({
-            targetDatabaseId: triageDetails.targetDatabaseId,
-            pageProperties: pageProperties,
-          });
-          logger.info(
-            "[MCP CLIENT LOG] Step 5 Updated: Notion Page Created/Details:",
-            notionPageDetails
-          );
-        }
-
-        // --- Step 6: Post Final Feedback ---
-        if (notionPageDetails && notionPageDetails.url) {
-          const replyMessage = existingNotionPage
-            ? `:information_source: This issue was already logged here: <${notionPageDetails.url}|Open in Notion>`
-            : `:white_check_mark: Issue successfully logged as *${triageDetails.issueType}* in Notion (Priority: ${issuePriority}): <${notionPageDetails.url}|Open in Notion>`;
-
+          // Inform user and wait for another reply, don't change state or re-ask.
           await tools_slack.postSlackReply_tool({
-            channelId: structuredSlackMessage.channelId,
-            messageText: replyMessage,
-            threadTimestamp: structuredSlackMessage.timestamp, // Reply to original thread
+            channelId: messagePayload.channel,
+            messageText:
+              ":warning: I had trouble processing your last reply. Could you please try rephrasing or ensure it directly answers the questions I asked?",
+            threadTimestamp: contextIdentifier,
           });
-          logger.info(
-            "[MCP CLIENT LOG] Step 6 Updated: Posted final feedback to Slack."
-          );
+          return; // Stop processing this reply, wait for user to try again.
         }
 
-        logger.info("[MCP CLIENT LOG] --- Reply Processing Complete --- B");
+        // If processing seemed successful, update the state
+        interactionState.initialParsedInfoRaw = updatedData;
+
+        logger.info(
+          `[MCP CLIENT LOG] Step 2 Updated (Reply Path for context ${contextIdentifier}): Parsed Issue Info (Raw) after reply:`,
+          interactionState.initialParsedInfoRaw
+        );
+
+        // Re-evaluate what's missing
+        let stillMissingInfo = [];
+        for (const profileName in NOTION_PROPERTY_PROFILES) {
+          const profile = NOTION_PROPERTY_PROFILES[profileName];
+          const value =
+            interactionState.initialParsedInfoRaw[profile.parsedKey];
+          if (!profile.isAdequate(value)) {
+            stillMissingInfo.push(profile);
+          }
+        }
+        interactionState.missingInfo = stillMissingInfo;
+
+        if (interactionState.missingInfo.length > 0) {
+          logger.info(
+            `[MCP CLIENT LOG] Context ${contextIdentifier}: Still missing info, asking again:`,
+            interactionState.missingInfo.map((p) => ({
+              field: p.displayName,
+              question: p.question,
+            }))
+          );
+          interactionState.createdAt = Date.now(); // Update timestamp
+          pendingInteractions[contextIdentifier] = interactionState; // Re-store updated state
+
+          const blocks = buildMissingInfoBlocks(
+            interactionState.missingInfo,
+            interactionState.initialParsedInfoRaw
+          );
+          await tools_slack.postSlackReply_tool({
+            channelId: messagePayload.channel,
+            messageText: "Thanks for the update! Still need a bit more info:",
+            blocks: blocks,
+            threadTimestamp: contextIdentifier, // Reply in the same context thread
+          });
+          logger.info(
+            `[MCP CLIENT LOG] Re-asked for info in context ${contextIdentifier}.`
+          );
+        } else {
+          // All info gathered, proceed to Notion
+          logger.info(
+            `[MCP CLIENT LOG] All info gathered for context ${contextIdentifier} via reply. Proceeding to Notion.`
+          );
+          // Pass the contextIdentifier for proper cleanup
+          await processAndCreateNotionPage(
+            interactionState.initialParsedInfoRaw,
+            interactionState.structuredSlackMessage, // Contains original message permalink, specific ts
+            interactionState,
+            contextIdentifier // Pass the key for cleanup
+          );
+          // processAndCreateNotionPage handles cleanup of pendingInteractions[contextIdentifier]
+        }
       } catch (error) {
-        logger.error("[MCP CLIENT ERROR] Failed to process user reply:", error);
-        // Attempt to notify the user in the thread about the error
+        logger.error(
+          `[MCP CLIENT ERROR] Failed to process user reply for context ${contextIdentifier}:`,
+          error
+        );
         try {
           await tools_slack.postSlackReply_tool({
-            channelId: interactionState.structuredSlackMessage.channelId,
+            channelId: messagePayload.channel,
             messageText: `:x: Sorry, I encountered an error trying to process your reply: ${error.message}`,
-            threadTimestamp: originalMessageTs,
+            threadTimestamp: contextIdentifier,
           });
         } catch (slackError) {
           logger.error(
-            "Failed to send error reply to slack about reply processing failure",
+            `Failed to send error reply to slack about reply processing failure for context ${contextIdentifier}`,
             slackError
           );
         }
-      } finally {
-        // --- Crucial: Cleanup state after processing (success or fail) ---
-        logger.info(
-          `[State Cleanup] Removing pending interaction for thread: ${originalMessageTs}`
-        );
-        delete pendingInteractions[originalMessageTs];
       }
-
-      // Stop processing after handling the reply
-      return;
+      return; // Handled as part of an ongoing interaction
     }
-    // --- End Check for Reply ---
 
-    // If it's not a reply to a tracked thread, process as a new message
+    // --- If not a reply to a tracked interaction context, process as a new potential issue ---
     logger.info(
-      "[MCP CLIENT LOG] Processing new message event:",
-      messagePayload
+      `[MCP CLIENT LOG] Context ${contextIdentifier} not found in pending interactions. Processing as new.`
     );
 
     try {
+      // Step 1: Structure incoming Slack message (get permalink, etc.)
+      // Note: structuredSlackMessage.timestamp will be messagePayload.ts
       const structuredSlackMessage =
         await tools_slack.receiveSlackIssueMessage_tool({
           user: messagePayload.user,
           text: messagePayload.text,
           channel: messagePayload.channel,
-          ts: messagePayload.ts,
+          ts: messagePayload.ts, // Crucially, this is the specific message's ts
           attachments: messagePayload.files || [],
         });
       logger.info(
@@ -982,7 +919,7 @@ app.post("/webhook/slack/event", async (req, res) => {
         structuredSlackMessage
       );
 
-      // Raw parsed info from LLM (or fallback)
+      // Step 2: Attempt to parse all relevant info from the message text using LLM
       const parsedIssueInfoRaw =
         await tools_processing.parseIssueFromSlackText_tool({
           rawSlackText: structuredSlackMessage.text,
@@ -993,7 +930,7 @@ app.post("/webhook/slack/event", async (req, res) => {
         parsedIssueInfoRaw
       );
 
-      // --- Gap Analysis ---
+      // --- Gap Analysis: Check if we have all needed Notion properties ---
       let missingInfo = [];
       for (const profileName in NOTION_PROPERTY_PROFILES) {
         const profile = NOTION_PROPERTY_PROFILES[profileName];
@@ -1004,6 +941,7 @@ app.post("/webhook/slack/event", async (req, res) => {
       }
 
       if (missingInfo.length > 0) {
+        // Information is missing, store current state and ask user for clarification
         logger.info(
           "[MCP CLIENT LOG] Missing information identified, asking user:",
           missingInfo.map((p) => ({
@@ -1012,259 +950,699 @@ app.post("/webhook/slack/event", async (req, res) => {
           }))
         );
 
-        // Store state for this interaction
-        const interactionKey = structuredSlackMessage.timestamp; // Original message ts is the thread key
-        pendingInteractions[interactionKey] = {
+        // Store state for this interaction, keyed by the contextIdentifier
+        pendingInteractions[contextIdentifier] = {
           initialParsedInfoRaw: parsedIssueInfoRaw,
-          structuredSlackMessage: structuredSlackMessage,
+          structuredSlackMessage: structuredSlackMessage, // Holds specific .ts for permalink
           missingInfo: missingInfo,
           createdAt: Date.now(),
         };
         logger.info(
-          `[State Store] Stored pending interaction for thread: ${interactionKey}`
+          `[State Store] Stored pending interaction for context: ${contextIdentifier}`
         );
 
-        // Format the questions
-        let questionText =
-          "Thanks for reporting this! To log it accurately in Notion, could you please clarify a few things?\n";
-        missingInfo.forEach((profile) => {
-          questionText += `\n- ${profile.question}`;
-        });
-        questionText += "\n\nReply in this thread with the answers.";
-
-        // Ask the questions in a thread reply
+        const blocks = buildMissingInfoBlocks(missingInfo, parsedIssueInfoRaw);
         await tools_slack.postSlackReply_tool({
           channelId: structuredSlackMessage.channelId,
-          messageText: questionText,
-          threadTimestamp: structuredSlackMessage.timestamp,
+          messageText:
+            "Thanks for reporting this! To log it accurately in Notion, could you please clarify a few things?",
+          blocks: blocks,
+          threadTimestamp: contextIdentifier, // Reply in the context thread
         });
         logger.info(
-          `[MCP CLIENT LOG] Asked clarifying questions in thread ${interactionKey}. Waiting for reply.`
+          `[MCP CLIENT LOG] Asked clarifying questions in context ${contextIdentifier}. Waiting for reply/interaction.`
         );
-
-        // Important: End processing here. We wait for the user's reply event.
-        res.status(200).json({ message: "Asking user for clarification." });
+        // res.status(200).json({ message: "Asking user for clarification." }); // Already sent
         return;
       }
 
-      // --- If no missing info, proceed directly to Notion creation ---
+      // If no missing info, proceed directly to Notion creation
       logger.info(
         "[MCP CLIENT LOG] No missing information identified, proceeding to Notion creation."
       );
-
-      // --- Normalize casing and provide defaults AFTER gap analysis ---
-      // (This section now only runs if there was no missing info initially)
-      const issueTitle =
-        parsedIssueInfoRaw.Title !== "UNKNOWN_TITLE"
-          ? parsedIssueInfoRaw.Title || "Untitled Issue"
-          : "Untitled Issue";
-      const issueDescription =
-        parsedIssueInfoRaw.Description || parsedIssueInfoRaw.originalText || ""; // Description should be originalText
-      const issueRootCause =
-        parsedIssueInfoRaw.RootCause !== "UNKNOWN_ROOT_CAUSE"
-          ? parsedIssueInfoRaw.RootCause || "N/A"
-          : "N/A";
-      const issuePictureUrl =
-        parsedIssueInfoRaw.PictureURL || "No picture attached";
-      const issueType =
-        parsedIssueInfoRaw.IssueType !== "UNKNOWN_ISSUE_TYPE"
-          ? parsedIssueInfoRaw.IssueType || "Task"
-          : "Task"; // Default to Task if still unknown after prompt
-      const issuePriority =
-        parsedIssueInfoRaw.Priority !== "UNKNOWN_PRIORITY"
-          ? parsedIssueInfoRaw.Priority || "Medium"
-          : "Medium"; // Default to Medium if still unknown
-      const issueSuccessCriteria =
-        parsedIssueInfoRaw.SuccessCriteria !== "UNKNOWN_SUCCESS_CRITERIA"
-          ? parsedIssueInfoRaw.SuccessCriteria || "N/A"
-          : "N/A";
-      const issueResolution =
-        parsedIssueInfoRaw.Resolution !== "UNKNOWN_RESOLUTION"
-          ? parsedIssueInfoRaw.Resolution || ""
-          : "";
-
-      // Pass the potentially modified/defaulted values to triage
-      const currentIssueDataForTriage = {
-        Title: issueTitle,
-        Description: issueDescription, // Pass original text as description
-        "Root Cause": issueRootCause,
-        "Issue Type": issueType,
-        Priority: issuePriority,
-        "Success Criteria": issueSuccessCriteria,
-        "Picture URL": issuePictureUrl,
-        Resolution: issueResolution, // from user, or ""
-        originalText: parsedIssueInfoRaw.originalText, // ensure original text is available for triage
-      };
-
-      logger.info(
-        "[MCP CLIENT LOG] Step 2.5: Data for Triage (Post-Normalization/Defaults):",
-        currentIssueDataForTriage
+      // Pass null for interactionState and contextIdentifier as this is a direct creation
+      await processAndCreateNotionPage(
+        parsedIssueInfoRaw,
+        structuredSlackMessage,
+        null,
+        null
       );
-
-      const triageDetails = await tools_processing.determineTriageCategory_tool(
-        {
-          // Pass the structured data that includes normalized/defaulted values.
-          // The triage tool might also need to be aware of "UNKNOWN_" values if it's to make finer decisions.
-          // For now, it uses the defaulted values.
-          structuredIssueData: currentIssueDataForTriage,
-        }
-      );
-      logger.info("[MCP CLIENT LOG] Step 3: Triage Details:", triageDetails);
-
-      // Normalize the permalink BEFORE using it for search or storage
-      const normalizedPermalink = canonicalizeSlackPermalink(
-        structuredSlackMessage.permalink
-      );
-
-      const existingNotionPage =
-        await tools_notion.findNotionPageBySlackLink_tool({
-          slackMessagePermalink: normalizedPermalink, // Use normalized permalink for search
-        });
-      logger.info(
-        "[MCP CLIENT LOG] Step 4: Existing Notion Page Check:",
-        existingNotionPage
-      );
-
-      let notionPageDetails;
-      if (existingNotionPage) {
-        logger.info(
-          `[MCP CLIENT LOG] Issue already logged in Notion: ${existingNotionPage.url}. Consider updating it.`
-        );
-        notionPageDetails = existingNotionPage;
-        // Optionally update:
-        // const updatedProps = { "Status": { select: { name: "Re-opened" } } }; // Example
-        // await tools_notion.updateNotionPage_tool({ pageId: existingNotionPage.pageId, propertiesToUpdate: updatedProps });
-      } else {
-        let resolutionContentForNotion = issueResolution;
-
-        // Construct properties according to Notion's expected schema
-        const pageProperties = {
-          Title: { title: [{ text: { content: issueTitle } }] },
-          Type: { select: { name: issueType } },
-          Priority: { multi_select: [{ name: issuePriority }] },
-          Status: { status: { name: "Triage" } },
-          "Success Criteria": {
-            rich_text: [{ text: { content: issueSuccessCriteria } }],
-          },
-          "Resolution TL'DR": {
-            rich_text: [{ text: { content: resolutionContentForNotion } }],
-          },
-          "Root Cause": { rich_text: [{ text: { content: issueRootCause } }] },
-          "Link to Slack Message": {
-            url: normalizedPermalink, // Use normalized permalink for storage
-          },
-          "Date Identified": {
-            date: {
-              start: new Date(
-                parseFloat(structuredSlackMessage.timestamp) * 1000
-              ).toISOString(),
-            },
-          },
-          Reporter: { people: [] }, // Optionally map from Slack user
-          Assigned: { people: [] },
-          Sprint: { relation: [] },
-          Due: { date: null },
-          "Program/Project": { relation: [] },
-          "⏰ Versions": { relation: [] },
-          Tags: { multi_select: [] },
-          "Parent-task": { relation: [] },
-          "Sub-tasks": { relation: [] },
-          "Task ID": { rich_text: [{ text: { content: "N/A" } }] },
-          "Mid-sprint task": { checkbox: false },
-          "Est. Hours": { number: null },
-        };
-
-        // Add Files property if attachments exist (using original message attachments)
-        if (
-          structuredSlackMessage.attachments &&
-          structuredSlackMessage.attachments.length > 0
-        ) {
-          pageProperties["Files"] = {
-            files: structuredSlackMessage.attachments
-              .map((file) => ({
-                name: file.name || file.title || "Slack Attachment",
-                type: "external",
-                external: {
-                  url: file.permalink,
-                },
-              }))
-              .filter((f) => f.external.url), // Ensure we only add files with a permalink
-          };
-          // Limit to a reasonable number if necessary (e.g., Notion API limits)
-          if (pageProperties["Files"].files.length > 10) {
-            logger.warn(
-              `[Notion Files] More than 10 attachments found, only linking the first 10.`
-            );
-            pageProperties["Files"].files = pageProperties["Files"].files.slice(
-              0,
-              10
-            );
-          }
-          // Remove the property if no valid files were found after filtering
-          if (pageProperties["Files"].files.length === 0) {
-            delete pageProperties["Files"];
-          }
-        }
-
-        notionPageDetails = await tools_notion.createNotionPage_tool({
-          targetDatabaseId: triageDetails.targetDatabaseId, // This now comes from the single NOTION_DATABASE_ID via triage tool
-          pageProperties: pageProperties,
-        });
-        logger.info(
-          "[MCP CLIENT LOG] Step 5: Notion Page Created/Details:",
-          notionPageDetails
-        );
-      }
-
-      // Post a confirmation reply ONLY when a new page is created OR if we successfully updated one (if update logic added)
-      // Ensure we are replying to the correct thread (original message timestamp)
-      if (notionPageDetails && notionPageDetails.url) {
-        // Check if we have details (either created or found/updated)
-        const replyMessage = existingNotionPage
-          ? `:information_source: This issue was already logged here: <${notionPageDetails.url}|Open in Notion>`
-          : `:white_check_mark: Issue successfully logged as *${triageDetails.issueType}* in Notion: <${notionPageDetails.url}|Open in Notion>`;
-
-        await tools_slack.postSlackReply_tool({
-          channelId: structuredSlackMessage.channelId,
-          messageText: replyMessage,
-          threadTimestamp: structuredSlackMessage.timestamp, // Always reply to the original message thread
-        });
-        logger.info("[MCP CLIENT LOG] Step 6: Posted feedback to Slack.");
-      }
-
-      logger.info("[MCP CLIENT LOG] --- Orchestration Complete --- A");
-      res.status(200).json({
-        success: true,
-        message: "Issue processed",
-        notionUrl: notionPageDetails.url,
-      });
+      // res.status(200).json({ /* ... */ }); // Already sent
     } catch (error) {
       logger.error("[MCP CLIENT ERROR] Orchestration failed:", error);
       try {
+        // Try to notify in the determined contextIdentifier
         await tools_slack.postSlackReply_tool({
-          channelId: messagePayload.channel,
+          channelId: messagePayload.channel, // channel from original payload
           messageText: `:x: Error processing issue: ${error.message}`,
-          threadTimestamp: messagePayload.ts,
+          threadTimestamp: contextIdentifier, // Post error in the context thread
         });
       } catch (slackError) {
-        logger.error("Failed to send error reply to slack", slackError);
+        logger.error(
+          `Failed to send error reply to slack for context ${contextIdentifier}`,
+          slackError
+        );
       }
-      res.status(500).json({ success: false, error: error.message });
+      // res.status(500).json({ success: false, error: error.message }); // Already sent 200
     }
+  } else if (slackEventPayload.challenge) {
+    // This case is handled by the url_verification check at the top,
+    // but good to have explicit else if for clarity if more event types were handled here.
+    // logger.info("[MCP CLIENT LOG] Responding to Slack URL verification challenge.");
+    // res.status(200).send(slackEventPayload.challenge);
   } else {
-    if (slackEventPayload.challenge) {
-      logger.info(
-        "[MCP CLIENT LOG] Responding to Slack URL verification challenge."
-      );
-      return res.status(200).send(slackEventPayload.challenge);
-    }
     logger.info(
       "[MCP CLIENT LOG] Received non-message or unhandled event type:",
       slackEventPayload.type
     );
-    res.status(200).send("Event type not handled by this demo.");
+    // res.status(200).send("Event type not handled by this demo."); // Potentially already sent 200
   }
 });
+
+// Helper function to build Block Kit blocks for missing info
+// (This function was implicitly used before, now explicitly defined)
+function buildMissingInfoBlocks(missingInfo, currentParsedInfo) {
+  const blocks = [
+    {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: "Thanks for reporting this! To log it accurately in Notion, could you please clarify a few things?",
+      },
+    },
+  ];
+
+  missingInfo.forEach((profile) => {
+    if (profile.parsedKey === "Priority") {
+      blocks.push({
+        type: "section",
+        block_id: `ask_${profile.parsedKey}_section`,
+        text: {
+          type: "mrkdwn",
+          text: `*${profile.displayName}:* ${profile.question}`,
+        },
+        accessory: {
+          type: "static_select",
+          action_id: "select_priority",
+          placeholder: { type: "plain_text", text: "Select priority..." },
+          initial_option:
+            currentParsedInfo.Priority &&
+            !currentParsedInfo.Priority.startsWith("UNKNOWN_")
+              ? {
+                  text: {
+                    type: "plain_text",
+                    text: currentParsedInfo.Priority,
+                  },
+                  value: currentParsedInfo.Priority,
+                }
+              : undefined,
+          options: [
+            {
+              text: { type: "plain_text", text: "High" },
+              value: "High",
+            },
+            {
+              text: { type: "plain_text", text: "Medium" },
+              value: "Medium",
+            },
+            { text: { type: "plain_text", text: "Low" }, value: "Low" },
+          ],
+        },
+      });
+    } else if (profile.parsedKey === "IssueType") {
+      blocks.push({
+        type: "section",
+        block_id: `ask_${profile.parsedKey}_section`,
+        text: {
+          type: "mrkdwn",
+          text: `*${profile.displayName}:* ${profile.question}`,
+        },
+        accessory: {
+          type: "static_select",
+          action_id: "select_issue_type",
+          placeholder: { type: "plain_text", text: "Select type..." },
+          initial_option:
+            currentParsedInfo.IssueType &&
+            !currentParsedInfo.IssueType.startsWith("UNKNOWN_")
+              ? {
+                  text: {
+                    type: "plain_text",
+                    text: currentParsedInfo.IssueType,
+                  },
+                  value: currentParsedInfo.IssueType,
+                }
+              : undefined,
+          options: [
+            { text: { type: "plain_text", text: "Bug" }, value: "Bug" },
+            { text: { type: "plain_text", text: "Task" }, value: "Task" },
+            {
+              text: { type: "plain_text", text: "Incident" },
+              value: "Incident",
+            },
+            { text: { type: "plain_text", text: "Test" }, value: "Test" },
+            // Add other valid issue types here
+          ],
+        },
+      });
+    } else {
+      // For fields requiring text input
+      blocks.push({
+        type: "input",
+        block_id: `ask_${profile.parsedKey}_input`,
+        element: {
+          type: "plain_text_input",
+          action_id: `provide_${profile.parsedKey}`,
+          placeholder: {
+            type: "plain_text",
+            text: `Your answer for ${profile.displayName}`,
+          },
+        },
+        label: {
+          type: "plain_text",
+          text: `${profile.displayName}: ${profile.question}`,
+        },
+      });
+      // The above input block is an example. The current app posts section blocks and asks for replies in thread.
+      // To keep current behavior for text replies:
+      blocks.pop(); // Remove the input block example
+      blocks.push({
+        type: "section",
+        text: {
+          type: "mrkdwn",
+          text: `*${profile.displayName}:* ${profile.question}\n(Please reply in this thread for this item)`,
+        },
+      });
+    }
+  });
+
+  // Add a general instruction if there are any button-based questions
+  const hasButtonQuestions = missingInfo.some(
+    (p) => p.parsedKey === "Priority" || p.parsedKey === "IssueType"
+  );
+  if (hasButtonQuestions) {
+    blocks.push({
+      type: "context",
+      elements: [
+        {
+          type: "mrkdwn",
+          text: "Please use the buttons above for Priority/Type and reply in this thread for any other requested details.",
+        },
+      ],
+    });
+  }
+  return blocks;
+}
+
+// --- Refactored Notion Creation Flow ---
+// Encapsulates steps from normalization to final Slack reply
+async function processAndCreateNotionPage(
+  parsedInfoRaw,
+  structuredSlackMessage,
+  interactionState = null, // The full state object, if processing from a pending interaction
+  interactionContextKey = null // The key used for pendingInteractions (e.g., thread_ts or original message_ts)
+) {
+  // Use interactionContextKey if available (it's the true context of the conversation),
+  // otherwise fallback to structuredSlackMessage.timestamp (ts of the specific message being processed directly)
+  const primaryContextForLog =
+    interactionContextKey || structuredSlackMessage.timestamp;
+
+  const logPrefix = interactionState
+    ? `[Interaction Flow Context ${primaryContextForLog}]`
+    : `[Direct Flow Thread ${structuredSlackMessage.timestamp}]`; // Direct flow still tied to specific message ts
+  logger.info(`${logPrefix} Starting Notion page creation/update process.`);
+
+  try {
+    // --- Normalize and default ---
+    const normalizedPermalink = canonicalizeSlackPermalink(
+      structuredSlackMessage.permalink
+    );
+    const issueTitle =
+      parsedInfoRaw.Title !== "UNKNOWN_TITLE"
+        ? parsedInfoRaw.Title || "Untitled Issue"
+        : "Untitled Issue";
+    const issueDescription =
+      parsedInfoRaw.Description || parsedInfoRaw.originalText || "";
+    const issueRootCause =
+      parsedInfoRaw.RootCause !== "UNKNOWN_ROOT_CAUSE"
+        ? parsedInfoRaw.RootCause || "N/A"
+        : "N/A";
+    const issuePictureUrl = parsedInfoRaw.PictureURL || "No picture attached";
+    const issueType =
+      parsedInfoRaw.IssueType !== "UNKNOWN_ISSUE_TYPE"
+        ? parsedInfoRaw.IssueType || "Task"
+        : "Task";
+    const issuePriority =
+      parsedInfoRaw.Priority !== "UNKNOWN_PRIORITY"
+        ? parsedInfoRaw.Priority || "Medium"
+        : "Medium";
+    const issueSuccessCriteria =
+      parsedInfoRaw.SuccessCriteria !== "UNKNOWN_SUCCESS_CRITERIA"
+        ? parsedInfoRaw.SuccessCriteria || "N/A"
+        : "N/A";
+    const issueResolution =
+      parsedInfoRaw.Resolution !== "UNKNOWN_RESOLUTION"
+        ? parsedInfoRaw.Resolution || ""
+        : "";
+
+    const currentIssueDataForTriage = {
+      Title: issueTitle,
+      Description: issueDescription,
+      "Root Cause": issueRootCause,
+      "Issue Type": issueType,
+      Priority: issuePriority,
+      "Success Criteria": issueSuccessCriteria,
+      "Picture URL": issuePictureUrl,
+      Resolution: issueResolution,
+      originalText: parsedInfoRaw.originalText,
+    };
+
+    logger.info(
+      `${logPrefix} Step 2.5: Data for Triage:`,
+      currentIssueDataForTriage
+    );
+
+    // --- Triage ---
+    const triageDetails = await tools_processing.determineTriageCategory_tool({
+      structuredIssueData: currentIssueDataForTriage,
+    });
+    logger.info(`${logPrefix} Step 3: Triage Details:`, triageDetails);
+
+    // --- Check Existing ---
+    const existingNotionPage =
+      await tools_notion.findNotionPageBySlackLink_tool({
+        slackMessagePermalink: normalizedPermalink,
+      });
+    logger.info(
+      `${logPrefix} Step 4: Existing Notion Page Check:`,
+      existingNotionPage
+    );
+
+    // --- Create/Update ---
+    let notionPageDetails;
+    if (existingNotionPage) {
+      logger.info(
+        `${logPrefix} Issue already logged: ${existingNotionPage.url}.`
+      );
+      notionPageDetails = existingNotionPage;
+      // TODO: Update existing page logic could go here
+    } else {
+      let resolutionContentForNotion = issueResolution;
+      const pageProperties = {
+        Title: { title: [{ text: { content: issueTitle } }] },
+        Type: { select: { name: issueType } },
+        Priority: { multi_select: [{ name: issuePriority }] },
+        Status: { status: { name: "Triage" } },
+        "Success Criteria": {
+          rich_text: [{ text: { content: issueSuccessCriteria } }],
+        },
+        "Resolution TL'DR": {
+          rich_text: [{ text: { content: resolutionContentForNotion } }],
+        },
+        "Root Cause": { rich_text: [{ text: { content: issueRootCause } }] },
+        "Link to Slack Message": { url: normalizedPermalink },
+        "Date Identified": {
+          date: {
+            start: new Date(
+              parseFloat(structuredSlackMessage.timestamp) * 1000
+            ).toISOString(),
+          },
+        },
+        Reporter: { people: [] },
+        Assigned: { people: [] },
+        Sprint: { relation: [] },
+        Due: { date: null },
+        "Program/Project": { relation: [] },
+        "⏰ Versions": { relation: [] },
+        Tags: { multi_select: [] },
+        "Parent-task": { relation: [] },
+        "Sub-tasks": { relation: [] },
+        "Task ID": { rich_text: [{ text: { content: "N/A" } }] },
+        "Mid-sprint task": { checkbox: false },
+        "Est. Hours": { number: null },
+      };
+      // Add Files property if attachments exist
+      if (
+        structuredSlackMessage.attachments &&
+        structuredSlackMessage.attachments.length > 0
+      ) {
+        pageProperties["Files"] = {
+          files: structuredSlackMessage.attachments
+            .map((file) => ({
+              name: file.name || file.title || "Slack Attachment",
+              type: "external",
+              external: { url: file.permalink },
+            }))
+            .filter((f) => f.external.url),
+        };
+        if (pageProperties["Files"].files.length > 10) {
+          logger.warn(
+            `${logPrefix} [Notion Files] More than 10 attachments found, only linking the first 10.`
+          );
+          pageProperties["Files"].files = pageProperties["Files"].files.slice(
+            0,
+            10
+          );
+        }
+        if (pageProperties["Files"].files.length === 0) {
+          delete pageProperties["Files"];
+        }
+      }
+
+      notionPageDetails = await tools_notion.createNotionPage_tool({
+        targetDatabaseId: triageDetails.targetDatabaseId,
+        pageProperties: pageProperties,
+      });
+      logger.info(
+        `${logPrefix} Step 5: Notion Page Created/Details:`,
+        notionPageDetails
+      );
+    }
+
+    // --- Post Feedback ---
+    if (notionPageDetails && notionPageDetails.url) {
+      const replyMessage = existingNotionPage
+        ? `:information_source: This issue was already logged here: <${notionPageDetails.url}|Open in Notion>`
+        : `:white_check_mark: ${
+            interactionState ? "All info received! Issue" : "Issue"
+          } logged as *${
+            triageDetails.issueType
+          }* in Notion (Priority: ${issuePriority}): <${
+            notionPageDetails.url
+          }|Open in Notion>`;
+
+      await tools_slack.postSlackReply_tool({
+        channelId: structuredSlackMessage.channelId,
+        messageText: replyMessage,
+        threadTimestamp: structuredSlackMessage.timestamp, // Reply to original thread
+      });
+      logger.info(`${logPrefix} Step 6: Posted final feedback to Slack.`);
+    }
+    logger.info(`${logPrefix} --- Notion Workflow Complete ---`);
+  } catch (error) {
+    logger.error(`${logPrefix} Error during Notion workflow:`, error);
+    // Attempt to notify user if possible
+    try {
+      await tools_slack.postSlackReply_tool({
+        channelId: structuredSlackMessage.channelId,
+        messageText: `:x: Sorry, I encountered an error while trying to log this to Notion: ${error.message}`,
+        // Reply in the original interaction context if known, otherwise to the specific message's thread
+        threadTimestamp:
+          interactionContextKey || structuredSlackMessage.timestamp,
+      });
+    } catch (slackError) {
+      logger.error(
+        `${logPrefix} Failed to send Notion workflow error reply to Slack:`,
+        slackError
+      );
+    }
+  } finally {
+    // --- Cleanup State (if called from interaction) ---
+    if (interactionState && interactionContextKey) {
+      logger.info(
+        `[State Cleanup] Removing completed/failed interaction for context: ${interactionContextKey}`
+      );
+      delete pendingInteractions[interactionContextKey];
+    } else if (interactionState) {
+      // This case should ideally not be hit if interactionContextKey is always passed with interactionState
+      const fallbackCleanupKey =
+        structuredSlackMessage.thread_ts || structuredSlackMessage.timestamp;
+      logger.warn(
+        `[State Cleanup] Interaction state provided for cleanup, but interactionContextKey was missing. Using fallback key for cleanup: ${fallbackCleanupKey} (structuredSlackMessage.timestamp was ${structuredSlackMessage.timestamp})`
+      );
+      delete pendingInteractions[fallbackCleanupKey];
+    }
+  }
+}
+
+// --- III. Slack Interactivity Handler ---
+
+// Middleware function to verify Slack signature
+const verifySlackSignature = (req, res, next) => {
+  if (!SLACK_SIGNING_SECRET) {
+    logger.warn(
+      "[Security] SLACK_SIGNING_SECRET not set. Skipping interaction verification."
+    );
+    return next();
+  }
+
+  // rawBody should be set by the bodyParser.urlencoded with verify option
+  if (!req.rawBody) {
+    logger.error(
+      "[Security] Raw body missing for signature verification. Ensure bodyParser.urlencoded with verify option ran first and successfully set req.rawBody for the interactive endpoint."
+    );
+    return res
+      .status(500)
+      .send("Internal Server Error: Raw body missing for verification");
+  }
+
+  const slackSignature = req.headers["x-slack-signature"];
+  const timestamp = req.headers["x-slack-request-timestamp"];
+
+  if (!slackSignature || !timestamp) {
+    logger.warn(
+      "[Security] Missing signature or timestamp headers for Slack interaction."
+    );
+    return res.status(400).send("Missing signature headers");
+  }
+
+  // Check timing
+  if (Math.abs(Date.now() / 1000 - timestamp) > 60 * 5) {
+    logger.warn("[Security] Slack interaction timestamp expired.");
+    return res.status(400).send("Timestamp expired");
+  }
+
+  // Verify signature
+  const hmac = crypto.createHmac("sha256", SLACK_SIGNING_SECRET);
+  const sig_basestring = "v0:" + timestamp + ":" + req.rawBody;
+
+  try {
+    hmac.update(sig_basestring);
+    const computedSignature = "v0=" + hmac.digest("hex");
+
+    if (
+      !crypto.timingSafeEqual(
+        Buffer.from(computedSignature, "utf8"),
+        Buffer.from(slackSignature, "utf8")
+      )
+    ) {
+      logger.warn("[Security] Slack interaction signature mismatch.");
+      return res.status(400).send("Signature mismatch");
+    }
+
+    logger.info("[Security] Slack interaction signature verified.");
+    next(); // Signature is valid
+  } catch (e) {
+    logger.error("[Security] Error during signature verification:", e);
+    return res.status(500).send("Verification error");
+  }
+};
+
+// Apply middleware specifically for the interaction route
+app.post(
+  "/webhook/slack/interactive",
+  // 1. Use the new urlencoded parser that also captures rawBody
+  urlencodedParserForInteractive,
+  // 2. Verify the signature (uses req.rawBody set by the parser above)
+  verifySlackSignature,
+  // 3. Handle the verified and parsed request
+  async (req, res) => {
+    let payload;
+    try {
+      // Defensive checks and logging for debugging the "Missing payload" issue
+      if (!req.body) {
+        logger.error(
+          "[Interaction] req.body is undefined or null after parsing attempts."
+        );
+        throw new Error("Request body object is missing.");
+      }
+      if (
+        Object.keys(req.body).length === 0 &&
+        req.rawBody &&
+        req.rawBody.includes("payload=")
+      ) {
+        logger.warn(
+          "[Interaction] req.body is an empty object, but rawBody contains 'payload='. This might indicate a parsing issue with urlencodedParser."
+        );
+      }
+      if (!req.body.payload) {
+        logger.error(
+          `[Interaction] req.body.payload is missing or empty. Current req.body keys: '${Object.keys(
+            req.body
+          ).join(", ")}'. req.body dump: ${JSON.stringify(req.body)}`
+        );
+        if (req.rawBody) {
+          logger.info(
+            `[Interaction] For context, rawBody was (first 200 chars): ${req.rawBody.substring(
+              0,
+              200
+            )}`
+          );
+        }
+        throw new Error("Missing payload field in parsed request body.");
+      }
+
+      payload = JSON.parse(req.body.payload);
+      logger.info(
+        `[Interaction] Received payload type: ${payload.type}, action_id: ${
+          payload.actions && payload.actions[0]
+            ? payload.actions[0].action_id
+            : "N/A"
+        }`
+      );
+    } catch (e) {
+      logger.error("[Interaction] Error parsing Slack payload:", e);
+      return res.status(200).send(); // Acknowledge Slack even on parse error
+    }
+
+    // Acknowledge Slack immediately
+    res.status(200).send();
+
+    // Handle Block Actions (e.g., button clicks, select menu choices)
+    if (
+      payload.type === "block_actions" &&
+      payload.actions &&
+      payload.actions.length > 0
+    ) {
+      const action = payload.actions[0];
+      const contextIdentifier =
+        payload.container?.thread_ts || payload.message?.ts;
+
+      if (!contextIdentifier) {
+        logger.warn(
+          "[Interaction] Block action without thread_ts in container or ts in message. Cannot identify context."
+        );
+        // Cannot reliably post a message back without context or channel/message identifiers.
+        // response_url could be used if we had a generic HTTP tool, but we don't here.
+        return;
+      }
+
+      const interactionState = pendingInteractions[contextIdentifier];
+      if (!interactionState) {
+        logger.warn(
+          `[Interaction] Interaction state not found or expired for context: ${contextIdentifier}. Action ID: ${action.action_id}`
+        );
+        // Try to inform the user in the original message's thread that the interaction has expired.
+        if (payload.channel?.id && payload.message?.ts) {
+          try {
+            await tools_slack.postSlackReply_tool({
+              channelId: payload.channel.id,
+              messageText:
+                ":warning: Sorry, this set of questions/buttons has expired. If you were in the middle of reporting an issue, please send your issue details again to start over.",
+              threadTimestamp: payload.message.ts, // Reply to the message that had the buttons
+            });
+            logger.info(
+              `[Interaction] Posted expiry message to thread ${payload.message.ts} in channel ${payload.channel.id}`
+            );
+          } catch (slackError) {
+            logger.error(
+              `[Interaction] Failed to send expiry message to Slack for context ${contextIdentifier}:`,
+              slackError
+            );
+          }
+        } else {
+          logger.warn(
+            `[Interaction] Cannot send expiry message for context ${contextIdentifier} due to missing channel_id or message_ts in payload.`
+          );
+        }
+        return; // Stop processing this action
+      }
+
+      let fieldUpdated = false;
+      const value = action.selected_option?.value || action.value; // Handles select menus and buttons
+      logger.info(
+        `[Interaction] Processing action '${action.action_id}' value '${value}' for context ${contextIdentifier}`
+      );
+
+      // --- Update State based on action ---
+      if (action.action_id === "select_priority" && value) {
+        interactionState.initialParsedInfoRaw.Priority = value;
+        fieldUpdated = true;
+      } else if (action.action_id === "select_issue_type" && value) {
+        interactionState.initialParsedInfoRaw.IssueType = value;
+        fieldUpdated = true;
+      }
+      // Add more else if blocks here for other interactive elements if any
+
+      if (fieldUpdated) {
+        logger.info(
+          `[Interaction] Context ${contextIdentifier}: Updated interaction state from button/select:`,
+          interactionState.initialParsedInfoRaw
+        );
+      } else {
+        logger.warn(
+          `[Interaction] Context ${contextIdentifier}: Unhandled action_id: ${action.action_id}`
+        );
+        return; // Don't proceed if action wasn't specifically handled
+      }
+
+      // --- Check Completion after button/select action ---
+      // Remove the field just updated by button/select from the list of missingInfo
+      // This assumes button/select actions directly satisfy a missing field.
+      interactionState.missingInfo = interactionState.missingInfo.filter(
+        (profile) =>
+          !(
+            profile.parsedKey === "Priority" &&
+            action.action_id === "select_priority"
+          ) &&
+          !(
+            profile.parsedKey === "IssueType" &&
+            action.action_id === "select_issue_type"
+          )
+        // Add checks for other action_ids if they directly map to a missingInfo profile
+      );
+
+      interactionState.createdAt = Date.now(); // Touch the interaction
+      pendingInteractions[contextIdentifier] = interactionState; // Store updated state
+
+      // Check if any fields *requiring text replies* are still in missingInfo
+      const needsTextReply = interactionState.missingInfo.some(
+        (p) =>
+          p.parsedKey === "SuccessCriteria" ||
+          p.parsedKey === "RootCause" ||
+          p.parsedKey === "Title" ||
+          p.parsedKey === "Description"
+        // Add other fields that are expected via text reply, not buttons
+      );
+
+      if (needsTextReply) {
+        logger.info(
+          `[Interaction] Context ${contextIdentifier} updated by button/select, but still waiting for text replies for other fields. Missing:`,
+          interactionState.missingInfo.map((m) => m.displayName)
+        );
+        // Optionally, update the original message using response_url to reflect the choice and ask for remaining
+        // For example, re-posting the updated list of questions.
+        // For now, we assume the user will see their button click and continue replying in the thread for text.
+        // The bot will re-ask on the next text message if info is still missing.
+        return;
+      }
+
+      // If we get here, it means no *further text reply* is needed *after this button click*.
+      // All button-updatable fields are filled, and no text-based fields remain in missingInfo.
+      logger.info(
+        `[Interaction] All information gathered for context ${contextIdentifier} via interactions/replies. Proceeding to Notion.`
+      );
+
+      // --- Trigger Notion Flow ---
+      // Pass the final updated data, original message details, and the context key.
+      await processAndCreateNotionPage(
+        interactionState.initialParsedInfoRaw,
+        interactionState.structuredSlackMessage,
+        interactionState,
+        contextIdentifier // Pass the key for cleanup
+      );
+      // processAndCreateNotionPage handles cleanup of pendingInteractions[contextIdentifier]
+    } else if (payload.type === "view_submission") {
+      // Handle modal submissions if you add them later
+      logger.info("[Interaction] Received view_submission (modal submitted).");
+      // Implement modal submission logic here
+    } else {
+      logger.warn(
+        "[Interaction] Received unhandled payload type or empty actions:",
+        payload.type
+      );
+    }
+  }
+);
 
 app.get("/", (req, res) => {
   res.send(
