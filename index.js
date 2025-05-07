@@ -98,6 +98,27 @@ app.use(bodyParser.json());
 let notionPages = {}; // Store mock Notion pages: { "slack_permalink_id": { pageId: "...", url: "..." } }
 let issueCounter = 0;
 
+// --- Simple In-Memory State Store for Pending Interactions ---
+// WARNING: This data is lost on server restart. Use a persistent store (DB, Redis, etc.) for production.
+let pendingInteractions = {}; // Key: original_message_ts, Value: { initialParsedInfoRaw, structuredSlackMessage, missingInfo, createdAt }
+const PENDING_INTERACTION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+
+// Cleanup old pending interactions periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const key in pendingInteractions) {
+    if (
+      now - pendingInteractions[key].createdAt >
+      PENDING_INTERACTION_TIMEOUT_MS
+    ) {
+      logger.info(
+        `[State Cleanup] Removing expired pending interaction for thread: ${key}`
+      );
+      delete pendingInteractions[key];
+    }
+  }
+}, 60 * 1000); // Check every minute
+
 // --- I. MCP Server: Tool Implementations (Mocks) ---
 // These mocks DO NOT use the actual API keys yet.
 // In a real implementation, you would initialize Slack/Notion SDKs here using the API keys.
@@ -341,81 +362,46 @@ const tools_processing = {
       "parseIssueFromSlackText_tool called with text:",
       rawSlackText
     );
+    // Fallback parsing (if OpenAI fails or is disabled)
     let title =
       rawSlackText.substring(0, 70) + (rawSlackText.length > 70 ? "..." : "");
     let rootCause = "N/A";
-    let priority = "Medium"; // Default priority
-
+    let priority = "Medium";
     let pictureUrl =
       attachments && attachments.length > 0
         ? attachments[0].image_url ||
           attachments[0].thumb_url ||
           "simulated_pic_url.jpg"
         : "No picture attached";
+    // Basic extraction logic (already present)
+    // ...
 
-    const rcMatch = rawSlackText.match(/RC:|Root Cause:(.*)/i);
-    if (rcMatch && rcMatch[1]) {
-      rootCause = rcMatch[1].trim();
-      title = rawSlackText.substring(0, rcMatch.index).trim();
-    }
-
-    // Detect phrases like "unsure of root cause" or "unknown root cause"
-    if (/unsure of root cause|unknown root cause/i.test(rawSlackText)) {
-      rootCause = "Unclear";
-    }
-
-    // Extract priority keywords (high|medium|low|critical|p0|p1|p2|p3|p4)
-    if (/\b(high|critical|urgent|p0|p1)\b/i.test(rawSlackText)) {
-      priority = "High";
-    } else if (/\b(low|minor|p3|p4)\b/i.test(rawSlackText)) {
-      priority = "Low";
-    } else if (/\b(?:medium|p2)\b/i.test(rawSlackText)) {
-      priority = "Medium";
-    }
-
-    // Attempt to clean title by removing leading severity statements like "This is a medium bug." etc.
-    let cleanedTitle = rawSlackText;
-    cleanedTitle = cleanedTitle.replace(/unsure of root cause.*/i, "").trim();
-    cleanedTitle = cleanedTitle.replace(
-      /this is a\s+(?:\w+\s+)?(?:bug|issue|problem)\.\s*/i,
-      ""
-    );
-    cleanedTitle = cleanedTitle.replace(/^\s+|\s+$/g, "");
-    if (cleanedTitle) {
-      title = cleanedTitle;
-    }
-
-    const titleMatch = rawSlackText.match(
-      /TITLE:(.*?)(?:\||RC:|Root Cause:|$)/i
-    );
-    if (titleMatch && titleMatch[1]) {
-      title = titleMatch[1].trim();
-    }
-
-    const structuredData = {
-      title: title,
-      description: rawSlackText,
-      rootCause: rootCause,
-      pictureUrl: pictureUrl,
+    const structuredDataFallback = {
+      Title: title,
+      Description: rawSlackText,
+      RootCause: rootCause, // Will be UNKNOWN_ROOT_CAUSE from LLM if not found
+      IssueType: "Task", // Will be UNKNOWN_ISSUE_TYPE from LLM
+      Priority: priority, // Will be UNKNOWN_PRIORITY from LLM
+      SuccessCriteria: "N/A", // Will be UNKNOWN_SUCCESS_CRITERIA from LLM
+      Resolution: "N/A", // Will be UNKNOWN_RESOLUTION from LLM
+      PictureURL: pictureUrl,
       originalText: rawSlackText,
-      priority: priority,
     };
-    logger.tool("Processing", "Parsed data:", structuredData);
 
     if (openai) {
       const prompt = `You are an expert issue triage assistant. Read the Slack message below and extract structured data for a Notion issue tracker. Output a JSON object with these keys:
 
-Title: A concise summary of the main problem or request, omitting severity words (e.g., "high/medium bug") and filler phrases (e.g., "This is a"). Use sentence case.
+Title: A concise summary of the main problem or request. If unclear, use "UNKNOWN_TITLE". Use sentence case.
 Description: The full original Slack message.
-Root Cause: If the message gives a root cause (e.g., after "RC:" or "Root Cause:"), extract it. If the message says the root cause is unknown/unclear/unsure, set to "Unclear". If not mentioned, set to "N/A".
-Issue Type: One of Bug, Incident, Task, Test. If the message describes a user-facing error, malfunction, or unexpected behavior, use "Bug". If it describes an outage or major disruption, use "Incident". If it is a request or action item, use "Task". If it is about testing, use "Test".
-Priority: One of High, Medium, Low. Infer from words like "critical", "urgent", "high" (→ High), "medium", "p2" (→ Medium), "low", "minor", "p3" (→ Low). If not specified, use your best judgment based on impact. Default to Medium if unsure.
-Success Criteria: If the message specifies what success looks like, extract it. Otherwise, set to "N/A".
-Resolution: If the message specifies a resolution, extract it. Otherwise, set to "N/A".
-Picture URL: If there is an attachment, use its URL. Otherwise, "No picture attached".
+RootCause: If the message gives a root cause, extract it. If the message says the root cause is unknown/unclear/unsure, set to "Unclear". If not mentioned at all, set to "UNKNOWN_ROOT_CAUSE". If the user explicitly states "N/A", use "N/A".
+IssueType: One of Bug, Incident, Task, Test. If not clearly inferable, use "UNKNOWN_ISSUE_TYPE".
+Priority: One of High, Medium, Low. If not clearly inferable, use "UNKNOWN_PRIORITY".
+SuccessCriteria: If the message specifies what success looks like, extract it. If not mentioned, set to "UNKNOWN_SUCCESS_CRITERIA". If the user explicitly states "N/A", use "N/A".
+Resolution: If the message specifies a resolution, extract it. If not mentioned, set to "UNKNOWN_RESOLUTION". If the user explicitly states "N/A", use "N/A".
+PictureURL: If there is an attachment, use its URL. Otherwise, "No picture attached".
 originalText: The raw Slack message.
 
-If the message is ambiguous, conversational, or missing details, use your best judgment to fill in the fields sensibly.
+IMPORTANT: Do NOT default to values like "Medium" for Priority or "Task" for IssueType if you are unsure. Use the "UNKNOWN_" variants.
 
 Examples:
 1. Slack Message: "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module"
@@ -423,12 +409,12 @@ Examples:
    {
      "Title": "Cannot get the valve to open on the adsorb side of the module",
      "Description": "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module",
-     "Root Cause": "Unclear",
-     "Issue Type": "Bug",
+     "RootCause": "Unclear",
+     "IssueType": "Bug",
      "Priority": "High",
-     "Success Criteria": "N/A",
-     "Resolution": "N/A",
-     "Picture URL": "No picture attached",
+     "SuccessCriteria": "UNKNOWN_SUCCESS_CRITERIA",
+     "Resolution": "UNKNOWN_RESOLUTION",
+     "PictureURL": "No picture attached",
      "originalText": "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module"
    }
 2. Slack Message: "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment."
@@ -436,27 +422,40 @@ Examples:
    {
      "Title": "Login page down for all users",
      "Description": "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment.",
-     "Root Cause": "Database migration failed.",
-     "Issue Type": "Incident",
+     "RootCause": "Database migration failed.",
+     "IssueType": "Incident",
      "Priority": "High",
-     "Success Criteria": "Users can log in again.",
+     "SuccessCriteria": "Users can log in again.",
      "Resolution": "Rolled back the faulty deployment.",
-     "Picture URL": "No picture attached",
+     "PictureURL": "No picture attached",
      "originalText": "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment."
    }
-3. Slack Message: "The pump is making a weird noise again. We fixed it by restarting the controller."
+3. Slack Message: "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now."
     Output:
     {
       "Title": "Pump is making a weird noise",
-      "Description": "The pump is making a weird noise again. We fixed it by restarting the controller.",
-      "Root Cause": "N/A",
-      "Issue Type": "Bug",
-      "Priority": "Medium",
-      "Success Criteria": "N/A",
+      "Description": "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now.",
+      "RootCause": "UNKNOWN_ROOT_CAUSE",
+      "IssueType": "Bug",
+      "Priority": "UNKNOWN_PRIORITY",
+      "SuccessCriteria": "N/A",
       "Resolution": "Fixed by restarting the controller.",
-      "Picture URL": "No picture attached",
-      "originalText": "The pump is making a weird noise again. We fixed it by restarting the controller."
+      "PictureURL": "No picture attached",
+      "originalText": "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now."
     }
+4. Slack Message: "Need to order more coffee."
+    Output:
+    {
+        "Title": "Order more coffee",
+        "Description": "Need to order more coffee.",
+        "RootCause": "UNKNOWN_ROOT_CAUSE",
+        "IssueType": "Task",
+        "Priority": "UNKNOWN_PRIORITY",
+        "SuccessCriteria": "UNKNOWN_SUCCESS_CRITERIA",
+        "Resolution": "UNKNOWN_RESOLUTION",
+        "PictureURL": "No picture attached",
+        "originalText": "Need to order more coffee."
+   }
 
 Slack Message:
 ${rawSlackText}
@@ -465,12 +464,12 @@ Return ONLY valid JSON.`;
 
       try {
         const response = await openai.chat.completions.create({
-          model: "gpt-4.1-2025-04-14",
+          model: "gpt-4.1-2025-04-14", // Or your preferred model
           messages: [{ role: "user", content: prompt }],
         });
         logger.tool(
           "Processing",
-          "Parsed data:",
+          "Parsed data from OpenAI:",
           response.choices[0].message.content
         );
         return JSON.parse(response.choices[0].message.content);
@@ -479,15 +478,14 @@ Return ONLY valid JSON.`;
           "[MCP TOOL ERROR: OpenAI] Failed to parse Slack message:",
           error.body || error.message
         );
-        throw new Error(
-          `OpenAI API error parsing Slack message: ${error.message}`
-        );
+        logger.warn("Falling back to basic parsing due to OpenAI error.");
+        return structuredDataFallback; // Fallback on error
       }
     } else {
       logger.warn(
-        "OpenAI client not initialized. Using mock parseIssueFromSlackText_tool."
+        "OpenAI client not initialized. Using mock/fallback parseIssueFromSlackText_tool."
       );
-      return structuredData;
+      return structuredDataFallback;
     }
   },
   determineTriageCategory_tool: async ({ structuredIssueData }) => {
@@ -547,6 +545,123 @@ Return ONLY valid JSON.`;
     const triageResult = { targetDatabaseId, issueType, priority };
     logger.tool("Processing", "Triage result:", triageResult);
     return triageResult;
+  },
+  parseAnswersAndUpdate_tool: async ({
+    userReplyText,
+    originalParsedInfo,
+    questionsAsked,
+  }) => {
+    logger.tool(
+      "Processing",
+      "parseAnswersAndUpdate_tool called with reply:",
+      userReplyText,
+      "Original Data:",
+      originalParsedInfo,
+      "Questions:",
+      questionsAsked
+    );
+
+    if (!openai) {
+      logger.warn(
+        "OpenAI client not initialized. Cannot parse answers. Returning original data."
+      );
+      return originalParsedInfo; // Cannot proceed without LLM
+    }
+
+    const questionList = questionsAsked
+      .map((q) => `- ${q.displayName}: ${q.question}`)
+      .join("\n");
+    const originalJson = JSON.stringify(originalParsedInfo, null, 2);
+
+    const prompt = `You are updating issue details based on a user's reply. The original parsed information was:
+\`\`\`json
+${originalJson}
+\`\`\`
+
+The user was asked to clarify the following fields based on these questions:
+${questionList}
+
+Their reply is: "${userReplyText}"
+
+Update the original JSON data based *only* on the information provided in the user's reply regarding the fields asked about. Preserve the original values for fields that were *not* asked about. If the user's reply doesn't clearly answer a specific question asked, keep the original value (which might be an 'UNKNOWN_' placeholder) for that field. 
+
+Output the complete, updated JSON object. Ensure the output is ONLY the valid JSON object.`;
+
+    try {
+      const response = await openai.chat.completions.create({
+        model: "gpt-4.1-2025-04-14", // Or your preferred model
+        messages: [{ role: "user", content: prompt }],
+      });
+      const updatedJsonString = response.choices[0].message.content;
+      logger.tool(
+        "Processing",
+        "Updated parsed data from OpenAI:",
+        updatedJsonString
+      );
+      // Basic validation: Try parsing and check if it's an object
+      const extractedJsonString = extractJson(updatedJsonString);
+      const updatedParsedInfo = JSON.parse(extractedJsonString);
+      if (typeof updatedParsedInfo !== "object" || updatedParsedInfo === null) {
+        throw new Error("LLM did not return a valid JSON object.");
+      }
+      return updatedParsedInfo;
+    } catch (error) {
+      logger.error(
+        "[MCP TOOL ERROR: OpenAI] Failed to parse answers and update data:",
+        error.body || error.message
+      );
+      logger.warn("Returning original data due to error parsing answers.");
+      return originalParsedInfo; // Return original on error
+    }
+  },
+};
+
+// Helper function to extract JSON block from potential markdown
+const extractJson = (text) => {
+  const match = text.match(/```(?:json)?\n([\s\S]*?)\n```/);
+  if (match && match[1]) {
+    return match[1];
+  }
+  // Fallback: assume the whole text might be JSON if no markdown fences found
+  return text.trim();
+};
+
+const NOTION_PROPERTY_PROFILES = {
+  Title: {
+    parsedKey: "Title",
+    displayName: "Title",
+    isAdequate: (value) =>
+      value && value.trim() !== "" && value !== "UNKNOWN_TITLE",
+    question: "What would be a concise title for this issue?",
+  },
+  IssueType: {
+    parsedKey: "IssueType",
+    displayName: "Issue Type",
+    isAdequate: (value) => value && !value.startsWith("UNKNOWN_"), // Will be one of Bug, Task, Incident, Test
+    question: "What type of issue is this? (e.g., Bug, Task, Incident, Test)",
+  },
+  Priority: {
+    parsedKey: "Priority",
+    displayName: "Priority",
+    isAdequate: (value) => value && !value.startsWith("UNKNOWN_"), // Will be one of High, Medium, Low
+    question: "What is the priority for this? (High, Medium, or Low)",
+  },
+  SuccessCriteria: {
+    parsedKey: "SuccessCriteria",
+    displayName: "Success Criteria",
+    // Consider adequate if user explicitly said N/A, or if it's filled. Ask if LLM is unsure (UNKNOWN_).
+    isAdequate: (value) => value && value !== "UNKNOWN_SUCCESS_CRITERIA",
+    question:
+      "What are the success criteria for resolving this? (If none, say 'N/A')",
+  },
+  // Example of how you might add Root Cause if you wanted to prompt for it
+  RootCause: {
+    parsedKey: "RootCause",
+    displayName: "Root Cause",
+    // Ask if the LLM couldn't determine it (UNKNOWN_). Allow "Unclear" or "N/A" as valid answers.
+    isAdequate: (value) => value && value !== "UNKNOWN_ROOT_CAUSE",
+    question:
+      "What is the suspected root cause? (If unknown, okay to say 'Unknown' or 'N/A')",
   },
 };
 
@@ -608,19 +723,250 @@ app.post("/webhook/slack/event", async (req, res) => {
     }
 
     const messagePayload = slackEventPayload.event;
-    if (
-      messagePayload.text &&
-      (messagePayload.text.startsWith(
-        ":white_check_mark: Issue successfully logged as"
-      ) ||
-        messagePayload.text.startsWith(":x: Error processing issue:") ||
-        messagePayload.text.startsWith("Issue logged in")) // legacy
-    ) {
-      logger.info("[MCP CLIENT LOG] Ignoring own confirmation/error message.");
-      return res.status(200).send("Ignoring confirmation message");
-    }
 
-    logger.info("[MCP CLIENT LOG] Processing message event:", messagePayload);
+    // --- Check if this is a reply to a tracked thread ---
+    if (
+      messagePayload.thread_ts &&
+      pendingInteractions[messagePayload.thread_ts]
+    ) {
+      const interactionState = pendingInteractions[messagePayload.thread_ts];
+      const originalMessageTs = messagePayload.thread_ts; // For clarity
+      logger.info(
+        `[MCP CLIENT LOG] Received reply for tracked thread: ${originalMessageTs}`
+      );
+
+      // Acknowledge Slack immediately before processing
+      res.status(200).json({ message: "Reply received, processing..." });
+
+      try {
+        // --- Phase 2 - Step 6: Process User's Answers ---
+        const userReplyText = messagePayload.text;
+        logger.info(`[MCP CLIENT LOG] Processing reply: "${userReplyText}"`);
+
+        const updatedParsedInfoRaw =
+          await tools_processing.parseAnswersAndUpdate_tool({
+            userReplyText: userReplyText,
+            originalParsedInfo: interactionState.initialParsedInfoRaw,
+            questionsAsked: interactionState.missingInfo,
+          });
+
+        logger.info(
+          "[MCP CLIENT LOG] Step 2 Updated: Parsed Issue Info (Raw) after reply:",
+          updatedParsedInfoRaw
+        );
+
+        // TODO: Optional: Re-evaluate gaps based on updatedParsedInfoRaw. For now, assume one round is enough.
+        // We will now proceed to Notion creation using the updated info.
+
+        // --- Continue workflow from Step 2.5 using UPDATED info ---
+        const structuredSlackMessage = interactionState.structuredSlackMessage; // Get original message details
+        const normalizedPermalink = canonicalizeSlackPermalink(
+          structuredSlackMessage.permalink
+        );
+
+        // Normalize based on the *updated* raw info
+        const issueTitle =
+          updatedParsedInfoRaw.Title !== "UNKNOWN_TITLE"
+            ? updatedParsedInfoRaw.Title || "Untitled Issue"
+            : "Untitled Issue";
+        const issueDescription =
+          updatedParsedInfoRaw.Description ||
+          updatedParsedInfoRaw.originalText ||
+          "";
+        const issueRootCause =
+          updatedParsedInfoRaw.RootCause !== "UNKNOWN_ROOT_CAUSE"
+            ? updatedParsedInfoRaw.RootCause || "N/A"
+            : "N/A";
+        const issuePictureUrl =
+          updatedParsedInfoRaw.PictureURL || "No picture attached";
+        const issueType =
+          updatedParsedInfoRaw.IssueType !== "UNKNOWN_ISSUE_TYPE"
+            ? updatedParsedInfoRaw.IssueType || "Task"
+            : "Task";
+        const issuePriority =
+          updatedParsedInfoRaw.Priority !== "UNKNOWN_PRIORITY"
+            ? updatedParsedInfoRaw.Priority || "Medium"
+            : "Medium";
+        const issueSuccessCriteria =
+          updatedParsedInfoRaw.SuccessCriteria !== "UNKNOWN_SUCCESS_CRITERIA"
+            ? updatedParsedInfoRaw.SuccessCriteria || "N/A"
+            : "N/A";
+        const issueResolution =
+          updatedParsedInfoRaw.Resolution !== "UNKNOWN_RESOLUTION"
+            ? updatedParsedInfoRaw.Resolution || ""
+            : "";
+
+        const currentIssueDataForTriage = {
+          Title: issueTitle,
+          Description: issueDescription,
+          "Root Cause": issueRootCause,
+          "Issue Type": issueType,
+          Priority: issuePriority,
+          "Success Criteria": issueSuccessCriteria,
+          "Picture URL": issuePictureUrl,
+          Resolution: issueResolution,
+          originalText: updatedParsedInfoRaw.originalText,
+        };
+
+        logger.info(
+          "[MCP CLIENT LOG] Step 2.5 Updated: Data for Triage (Post-Reply & Normalization):",
+          currentIssueDataForTriage
+        );
+
+        const triageDetails =
+          await tools_processing.determineTriageCategory_tool({
+            structuredIssueData: currentIssueDataForTriage,
+          });
+        logger.info(
+          "[MCP CLIENT LOG] Step 3 Updated: Triage Details:",
+          triageDetails
+        );
+
+        const existingNotionPage =
+          await tools_notion.findNotionPageBySlackLink_tool({
+            slackMessagePermalink: normalizedPermalink,
+          });
+        logger.info(
+          "[MCP CLIENT LOG] Step 4 Updated: Existing Notion Page Check:",
+          existingNotionPage
+        );
+
+        let notionPageDetails;
+        if (existingNotionPage) {
+          logger.info(
+            `[MCP CLIENT LOG] Issue already logged in Notion: ${existingNotionPage.url}. Consider implementing update logic.`
+          );
+          notionPageDetails = existingNotionPage;
+          // TODO: Optionally update existing page here
+        } else {
+          let resolutionContentForNotion = issueResolution;
+          const pageProperties = {
+            Title: { title: [{ text: { content: issueTitle } }] },
+            Type: { select: { name: issueType } },
+            Priority: { multi_select: [{ name: issuePriority }] },
+            Status: { status: { name: "Triage" } },
+            "Success Criteria": {
+              rich_text: [{ text: { content: issueSuccessCriteria } }],
+            },
+            "Resolution TL'DR": {
+              rich_text: [{ text: { content: resolutionContentForNotion } }],
+            },
+            "Root Cause": {
+              rich_text: [{ text: { content: issueRootCause } }],
+            },
+            "Link to Slack Message": { url: normalizedPermalink },
+            "Date Identified": {
+              date: {
+                start: new Date(
+                  parseFloat(structuredSlackMessage.timestamp) * 1000
+                ).toISOString(),
+              },
+            },
+            Reporter: { people: [] },
+            Assigned: { people: [] },
+            Sprint: { relation: [] },
+            Due: { date: null },
+            "Program/Project": { relation: [] },
+            "⏰ Versions": { relation: [] },
+            Tags: { multi_select: [] },
+            "Parent-task": { relation: [] },
+            "Sub-tasks": { relation: [] },
+            "Task ID": { rich_text: [{ text: { content: "N/A" } }] },
+            "Mid-sprint task": { checkbox: false },
+            "Est. Hours": { number: null },
+          };
+
+          // Add Files property if attachments exist
+          if (
+            structuredSlackMessage.attachments &&
+            structuredSlackMessage.attachments.length > 0
+          ) {
+            pageProperties["Files"] = {
+              files: structuredSlackMessage.attachments
+                .map((file) => ({
+                  name: file.name || file.title || "Slack Attachment",
+                  type: "external",
+                  external: {
+                    url: file.permalink,
+                  },
+                }))
+                .filter((f) => f.external.url), // Ensure we only add files with a permalink
+            };
+            // Limit to a reasonable number if necessary (e.g., Notion API limits)
+            if (pageProperties["Files"].files.length > 10) {
+              logger.warn(
+                `[Notion Files] More than 10 attachments found, only linking the first 10.`
+              );
+              pageProperties["Files"].files = pageProperties[
+                "Files"
+              ].files.slice(0, 10);
+            }
+            // Remove the property if no valid files were found after filtering
+            if (pageProperties["Files"].files.length === 0) {
+              delete pageProperties["Files"];
+            }
+          }
+
+          notionPageDetails = await tools_notion.createNotionPage_tool({
+            targetDatabaseId: triageDetails.targetDatabaseId,
+            pageProperties: pageProperties,
+          });
+          logger.info(
+            "[MCP CLIENT LOG] Step 5 Updated: Notion Page Created/Details:",
+            notionPageDetails
+          );
+        }
+
+        // --- Step 6: Post Final Feedback ---
+        if (notionPageDetails && notionPageDetails.url) {
+          const replyMessage = existingNotionPage
+            ? `:information_source: This issue was already logged here: <${notionPageDetails.url}|Open in Notion>`
+            : `:white_check_mark: Issue successfully logged as *${triageDetails.issueType}* in Notion (Priority: ${issuePriority}): <${notionPageDetails.url}|Open in Notion>`;
+
+          await tools_slack.postSlackReply_tool({
+            channelId: structuredSlackMessage.channelId,
+            messageText: replyMessage,
+            threadTimestamp: structuredSlackMessage.timestamp, // Reply to original thread
+          });
+          logger.info(
+            "[MCP CLIENT LOG] Step 6 Updated: Posted final feedback to Slack."
+          );
+        }
+
+        logger.info("[MCP CLIENT LOG] --- Reply Processing Complete --- B");
+      } catch (error) {
+        logger.error("[MCP CLIENT ERROR] Failed to process user reply:", error);
+        // Attempt to notify the user in the thread about the error
+        try {
+          await tools_slack.postSlackReply_tool({
+            channelId: interactionState.structuredSlackMessage.channelId,
+            messageText: `:x: Sorry, I encountered an error trying to process your reply: ${error.message}`,
+            threadTimestamp: originalMessageTs,
+          });
+        } catch (slackError) {
+          logger.error(
+            "Failed to send error reply to slack about reply processing failure",
+            slackError
+          );
+        }
+      } finally {
+        // --- Crucial: Cleanup state after processing (success or fail) ---
+        logger.info(
+          `[State Cleanup] Removing pending interaction for thread: ${originalMessageTs}`
+        );
+        delete pendingInteractions[originalMessageTs];
+      }
+
+      // Stop processing after handling the reply
+      return;
+    }
+    // --- End Check for Reply ---
+
+    // If it's not a reply to a tracked thread, process as a new message
+    logger.info(
+      "[MCP CLIENT LOG] Processing new message event:",
+      messagePayload
+    );
 
     try {
       const structuredSlackMessage =
@@ -636,41 +982,131 @@ app.post("/webhook/slack/event", async (req, res) => {
         structuredSlackMessage
       );
 
-      const parsedIssueInfo =
+      // Raw parsed info from LLM (or fallback)
+      const parsedIssueInfoRaw =
         await tools_processing.parseIssueFromSlackText_tool({
           rawSlackText: structuredSlackMessage.text,
           attachments: structuredSlackMessage.attachments,
         });
       logger.info(
-        "[MCP CLIENT LOG] Step 2: Parsed Issue Info:",
-        parsedIssueInfo
+        "[MCP CLIENT LOG] Step 2: Initial Parsed Issue Info (Raw):",
+        parsedIssueInfoRaw
       );
 
-      // --- Normalize casing differences between fallback and OpenAI outputs ---
+      // --- Gap Analysis ---
+      let missingInfo = [];
+      for (const profileName in NOTION_PROPERTY_PROFILES) {
+        const profile = NOTION_PROPERTY_PROFILES[profileName];
+        const value = parsedIssueInfoRaw[profile.parsedKey];
+        if (!profile.isAdequate(value)) {
+          missingInfo.push(profile);
+        }
+      }
+
+      if (missingInfo.length > 0) {
+        logger.info(
+          "[MCP CLIENT LOG] Missing information identified, asking user:",
+          missingInfo.map((p) => ({
+            field: p.displayName,
+            question: p.question,
+          }))
+        );
+
+        // Store state for this interaction
+        const interactionKey = structuredSlackMessage.timestamp; // Original message ts is the thread key
+        pendingInteractions[interactionKey] = {
+          initialParsedInfoRaw: parsedIssueInfoRaw,
+          structuredSlackMessage: structuredSlackMessage,
+          missingInfo: missingInfo,
+          createdAt: Date.now(),
+        };
+        logger.info(
+          `[State Store] Stored pending interaction for thread: ${interactionKey}`
+        );
+
+        // Format the questions
+        let questionText =
+          "Thanks for reporting this! To log it accurately in Notion, could you please clarify a few things?\n";
+        missingInfo.forEach((profile) => {
+          questionText += `\n- ${profile.question}`;
+        });
+        questionText += "\n\nReply in this thread with the answers.";
+
+        // Ask the questions in a thread reply
+        await tools_slack.postSlackReply_tool({
+          channelId: structuredSlackMessage.channelId,
+          messageText: questionText,
+          threadTimestamp: structuredSlackMessage.timestamp,
+        });
+        logger.info(
+          `[MCP CLIENT LOG] Asked clarifying questions in thread ${interactionKey}. Waiting for reply.`
+        );
+
+        // Important: End processing here. We wait for the user's reply event.
+        res.status(200).json({ message: "Asking user for clarification." });
+        return;
+      }
+
+      // --- If no missing info, proceed directly to Notion creation ---
+      logger.info(
+        "[MCP CLIENT LOG] No missing information identified, proceeding to Notion creation."
+      );
+
+      // --- Normalize casing and provide defaults AFTER gap analysis ---
+      // (This section now only runs if there was no missing info initially)
       const issueTitle =
-        parsedIssueInfo.Title || parsedIssueInfo.title || "Untitled";
+        parsedIssueInfoRaw.Title !== "UNKNOWN_TITLE"
+          ? parsedIssueInfoRaw.Title || "Untitled Issue"
+          : "Untitled Issue";
       const issueDescription =
-        parsedIssueInfo.Description || parsedIssueInfo.description || "";
+        parsedIssueInfoRaw.Description || parsedIssueInfoRaw.originalText || ""; // Description should be originalText
       const issueRootCause =
-        parsedIssueInfo["Root Cause"] || parsedIssueInfo.rootCause || "N/A";
+        parsedIssueInfoRaw.RootCause !== "UNKNOWN_ROOT_CAUSE"
+          ? parsedIssueInfoRaw.RootCause || "N/A"
+          : "N/A";
       const issuePictureUrl =
-        parsedIssueInfo["Picture URL"] ||
-        parsedIssueInfo.pictureUrl ||
-        "No picture attached";
+        parsedIssueInfoRaw.PictureURL || "No picture attached";
       const issueType =
-        parsedIssueInfo["Issue Type"] || parsedIssueInfo.issueType || "Task";
+        parsedIssueInfoRaw.IssueType !== "UNKNOWN_ISSUE_TYPE"
+          ? parsedIssueInfoRaw.IssueType || "Task"
+          : "Task"; // Default to Task if still unknown after prompt
       const issuePriority =
-        parsedIssueInfo["Priority"] || parsedIssueInfo.priority || "Medium";
+        parsedIssueInfoRaw.Priority !== "UNKNOWN_PRIORITY"
+          ? parsedIssueInfoRaw.Priority || "Medium"
+          : "Medium"; // Default to Medium if still unknown
       const issueSuccessCriteria =
-        parsedIssueInfo["Success Criteria"] ||
-        parsedIssueInfo.successCriteria ||
-        "N/A";
+        parsedIssueInfoRaw.SuccessCriteria !== "UNKNOWN_SUCCESS_CRITERIA"
+          ? parsedIssueInfoRaw.SuccessCriteria || "N/A"
+          : "N/A";
       const issueResolution =
-        parsedIssueInfo.Resolution || parsedIssueInfo.resolution;
+        parsedIssueInfoRaw.Resolution !== "UNKNOWN_RESOLUTION"
+          ? parsedIssueInfoRaw.Resolution || ""
+          : "";
+
+      // Pass the potentially modified/defaulted values to triage
+      const currentIssueDataForTriage = {
+        Title: issueTitle,
+        Description: issueDescription, // Pass original text as description
+        "Root Cause": issueRootCause,
+        "Issue Type": issueType,
+        Priority: issuePriority,
+        "Success Criteria": issueSuccessCriteria,
+        "Picture URL": issuePictureUrl,
+        Resolution: issueResolution, // from user, or ""
+        originalText: parsedIssueInfoRaw.originalText, // ensure original text is available for triage
+      };
+
+      logger.info(
+        "[MCP CLIENT LOG] Step 2.5: Data for Triage (Post-Normalization/Defaults):",
+        currentIssueDataForTriage
+      );
 
       const triageDetails = await tools_processing.determineTriageCategory_tool(
         {
-          structuredIssueData: parsedIssueInfo,
+          // Pass the structured data that includes normalized/defaulted values.
+          // The triage tool might also need to be aware of "UNKNOWN_" values if it's to make finer decisions.
+          // For now, it uses the defaulted values.
+          structuredIssueData: currentIssueDataForTriage,
         }
       );
       logger.info("[MCP CLIENT LOG] Step 3: Triage Details:", triageDetails);
@@ -699,14 +1135,7 @@ app.post("/webhook/slack/event", async (req, res) => {
         // const updatedProps = { "Status": { select: { name: "Re-opened" } } }; // Example
         // await tools_notion.updateNotionPage_tool({ pageId: existingNotionPage.pageId, propertiesToUpdate: updatedProps });
       } else {
-        let resolutionContent = ""; // Default to empty
-        if (
-          issueResolution &&
-          issueResolution.trim() !== "" &&
-          issueResolution.toUpperCase() !== "N/A"
-        ) {
-          resolutionContent = issueResolution.trim();
-        }
+        let resolutionContentForNotion = issueResolution;
 
         // Construct properties according to Notion's expected schema
         const pageProperties = {
@@ -718,7 +1147,7 @@ app.post("/webhook/slack/event", async (req, res) => {
             rich_text: [{ text: { content: issueSuccessCriteria } }],
           },
           "Resolution TL'DR": {
-            rich_text: [{ text: { content: resolutionContent } }],
+            rich_text: [{ text: { content: resolutionContentForNotion } }],
           },
           "Root Cause": { rich_text: [{ text: { content: issueRootCause } }] },
           "Link to Slack Message": {
@@ -745,6 +1174,38 @@ app.post("/webhook/slack/event", async (req, res) => {
           "Est. Hours": { number: null },
         };
 
+        // Add Files property if attachments exist (using original message attachments)
+        if (
+          structuredSlackMessage.attachments &&
+          structuredSlackMessage.attachments.length > 0
+        ) {
+          pageProperties["Files"] = {
+            files: structuredSlackMessage.attachments
+              .map((file) => ({
+                name: file.name || file.title || "Slack Attachment",
+                type: "external",
+                external: {
+                  url: file.permalink,
+                },
+              }))
+              .filter((f) => f.external.url), // Ensure we only add files with a permalink
+          };
+          // Limit to a reasonable number if necessary (e.g., Notion API limits)
+          if (pageProperties["Files"].files.length > 10) {
+            logger.warn(
+              `[Notion Files] More than 10 attachments found, only linking the first 10.`
+            );
+            pageProperties["Files"].files = pageProperties["Files"].files.slice(
+              0,
+              10
+            );
+          }
+          // Remove the property if no valid files were found after filtering
+          if (pageProperties["Files"].files.length === 0) {
+            delete pageProperties["Files"];
+          }
+        }
+
         notionPageDetails = await tools_notion.createNotionPage_tool({
           targetDatabaseId: triageDetails.targetDatabaseId, // This now comes from the single NOTION_DATABASE_ID via triage tool
           pageProperties: pageProperties,
@@ -755,18 +1216,23 @@ app.post("/webhook/slack/event", async (req, res) => {
         );
       }
 
-      // Post a confirmation reply ONLY when a new page is created
-      if (!existingNotionPage) {
-        const replyMessage = `:white_check_mark: Issue successfully logged as *${triageDetails.issueType}* in Notion: <${notionPageDetails.url}|Open in Notion>`;
+      // Post a confirmation reply ONLY when a new page is created OR if we successfully updated one (if update logic added)
+      // Ensure we are replying to the correct thread (original message timestamp)
+      if (notionPageDetails && notionPageDetails.url) {
+        // Check if we have details (either created or found/updated)
+        const replyMessage = existingNotionPage
+          ? `:information_source: This issue was already logged here: <${notionPageDetails.url}|Open in Notion>`
+          : `:white_check_mark: Issue successfully logged as *${triageDetails.issueType}* in Notion: <${notionPageDetails.url}|Open in Notion>`;
+
         await tools_slack.postSlackReply_tool({
           channelId: structuredSlackMessage.channelId,
           messageText: replyMessage,
-          threadTimestamp: structuredSlackMessage.timestamp,
+          threadTimestamp: structuredSlackMessage.timestamp, // Always reply to the original message thread
         });
         logger.info("[MCP CLIENT LOG] Step 6: Posted feedback to Slack.");
       }
 
-      logger.info("[MCP CLIENT LOG] --- Orchestration Complete ---");
+      logger.info("[MCP CLIENT LOG] --- Orchestration Complete --- A");
       res.status(200).json({
         success: true,
         message: "Issue processed",
