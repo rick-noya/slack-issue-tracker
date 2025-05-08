@@ -1655,31 +1655,22 @@ function mapToNotionProperties(parsedInfo, permalink, issueType, priority) {
       title: [{ text: { content: parsedInfo.Title || "Untitled Issue" } }],
     },
     Status: {
-      // Assuming 'Status' is a Select property
-      select: { name: "New" }, // Default status
+      // Changed from select to status
+      status: { name: "New" }, // Default status - ensure "New" is a valid status option in your DB
     },
     "Link to Slack Message": {
       // Assuming this is a URL property
       url: canonicalizeSlackPermalink(permalink), // Use canonicalized link
     },
     Priority: {
-      // Assuming 'Priority' is a Select property
-      select: { name: priority }, // Use determined priority
+      // Changed from select to multi_select
+      multi_select: [{ name: priority }], // Use determined priority - ensure this option exists in your DB
     },
     Type: {
       // Assuming 'Type' is a Select property
       select: { name: issueType }, // Use determined type
     },
-    // Add mappings for other fields like Description, RootCause, SuccessCriteria, Resolution
-    Description: {
-      rich_text: [
-        {
-          text: {
-            content: parsedInfo.Description || parsedInfo.originalText || "N/A",
-          },
-        },
-      ],
-    },
+    // Removed "Description" and "Resolution" as they don't exist in the target Notion DB per the error
     "Root Cause": {
       rich_text: [
         {
@@ -1687,7 +1678,7 @@ function mapToNotionProperties(parsedInfo, permalink, issueType, priority) {
             content:
               parsedInfo.RootCause !== "UNKNOWN_ROOT_CAUSE"
                 ? parsedInfo.RootCause
-                : "N/A",
+                : "N/A", // Or handle as truly empty if Notion doesn't like "N/A" for rich_text
           },
         },
       ],
@@ -1699,28 +1690,27 @@ function mapToNotionProperties(parsedInfo, permalink, issueType, priority) {
             content:
               parsedInfo.SuccessCriteria !== "UNKNOWN_SUCCESS_CRITERIA"
                 ? parsedInfo.SuccessCriteria
-                : "N/A",
-          },
-        },
-      ],
-    },
-    Resolution: {
-      rich_text: [
-        {
-          text: {
-            content:
-              parsedInfo.Resolution !== "UNKNOWN_RESOLUTION"
-                ? parsedInfo.Resolution
-                : "N/A",
+                : "N/A", // Or handle as truly empty
           },
         },
       ],
     },
     // Add others as needed based on your NOTION_PROPERTY_PROFILES and DB schema
   };
-  // Clean up properties with null/undefined selects before sending
+  // Clean up properties with null/undefined selects or multi_selects before sending
   Object.keys(properties).forEach((key) => {
     if (properties[key].select && !properties[key].select.name) {
+      delete properties[key];
+    }
+    if (
+      properties[key].multi_select &&
+      (!properties[key].multi_select[0] ||
+        !properties[key].multi_select[0].name)
+    ) {
+      delete properties[key];
+    }
+    // Add similar check for status if an empty name is problematic
+    if (properties[key].status && !properties[key].status.name) {
       delete properties[key];
     }
   });
