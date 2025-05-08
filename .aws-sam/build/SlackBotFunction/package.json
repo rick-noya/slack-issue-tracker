@@ -1,0 +1,22 @@
+{
+  "name": "mcp-slack-notion-node",
+  "version": "1.0.0",
+  "description": "MCP architecture demo for Slack to Notion integration with environment variables and API key placeholders",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "@notionhq/client": "^2.2.15",
+    "@slack/web-api": "^7.0.0",
+    "@aws-sdk/client-dynamodb": "^3.585.0",
+    "@aws-sdk/lib-dynamodb": "^3.585.0",
+    "aws-serverless-express": "^3.4.0",
+    "body-parser": "^1.20.2",
+    "express": "^4.19.2",
+    "openai": "^4.97.0"
+  },
+  "author": "AI Assistant",
+  "license": "ISC"
+}

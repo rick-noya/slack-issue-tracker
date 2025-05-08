@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Slack bot backend for issue tracking with Notion/OpenAI/Supabase state.
+
+  '
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 512
+Resources:
+  SlackBotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SlackNotionBotFunction
+      CodeUri: SlackBotFunction
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Architectures:
+      - x86_64
+      Environment:
+        Variables:
+          LOG_LEVEL: info
+          NOTION_DATABASE_ID:
+            Ref: NotionDatabaseId
+          SLACK_BOT_TOKEN:
+            Ref: SlackBotTokenParameter
+          SLACK_SIGNING_SECRET:
+            Ref: SlackSigningSecretParameter
+          NOTION_API_KEY:
+            Ref: NotionApiKeyParameter
+          OPENAI_API_KEY:
+            Ref: OpenaiApiKeyParameter
+      Events:
+        SlackEventApi:
+          Type: Api
+          Properties:
+            Path: /webhook/slack/event
+            Method: post
+        SlackInteractiveApi:
+          Type: Api
+          Properties:
+            Path: /webhook/slack/interactive
+            Method: post
+    Metadata:
+      SamResourceId: SlackBotFunction
+Parameters:
+  NotionDatabaseId:
+    Type: String
+    Description: Notion Database ID for the issue tracker.
+  SlackBotTokenParameter:
+    Type: String
+    Description: Slack Bot Token (OAuth Token).
+    NoEcho: true
+  SlackSigningSecretParameter:
+    Type: String
+    Description: Slack App Signing Secret.
+    NoEcho: true
+  NotionApiKeyParameter:
+    Type: String
+    Description: Notion API Integration Key.
+    NoEcho: true
+  OpenaiApiKeyParameter:
+    Type: String
+    Description: OpenAI API Key.
+    NoEcho: true
+Outputs:
+  SlackBotApiEndpoint:
+    Description: API Gateway endpoint URL for Slack Bot
+    Value:
+      Fn::Sub: https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod
