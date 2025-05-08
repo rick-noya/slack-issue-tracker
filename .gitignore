@@ -107,3 +107,8 @@ dist
 
 # Kate temp files
 .*.kate-swp 
+
+# AWS SAM
+.aws-sam/
+
+samconfig.toml

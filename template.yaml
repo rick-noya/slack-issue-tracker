@@ -1,0 +1,70 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: MCP Slack-Notion Lambda App with DynamoDB state
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: nodejs18.x
+    MemorySize: 256
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+        PENDING_INTERACTIONS_TABLE: SlackInteractionState
+        LOG_LEVEL: info
+        # Add your other secrets/keys here or use AWS Secrets Manager
+
+Resources:
+  SlackEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.slackEventHandler
+      CodeUri: .
+      Description: Handles Slack event webhooks
+      Events:
+        SlackEventApi:
+          Type: Api
+          Properties:
+            Path: /webhook/slack/event
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: SlackInteractionState
+      Environment:
+        Variables:
+          SLACK_SIGNING_SECRET: "<set-in-console-or-secrets-manager>"
+          NOTION_API_KEY: "<set-in-console-or-secrets-manager>"
+          OPENAI_API_KEY: "<set-in-console-or-secrets-manager>"
+          SLACK_BOT_TOKEN: "<set-in-console-or-secrets-manager>"
+          NOTION_DATABASE_ID: "<set-in-console-or-secrets-manager>"
+
+  SlackInteractiveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: index.slackInteractiveHandler
+      CodeUri: .
+      Description: Handles Slack interactive webhooks
+      Events:
+        SlackInteractiveApi:
+          Type: Api
+          Properties:
+            Path: /webhook/slack/interactive
+            Method: post
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: SlackInteractionState
+      Environment:
+        Variables:
+          SLACK_SIGNING_SECRET: "<set-in-console-or-secrets-manager>"
+          NOTION_API_KEY: "<set-in-console-or-secrets-manager>"
+          OPENAI_API_KEY: "<set-in-console-or-secrets-manager>"
+          SLACK_BOT_TOKEN: "<set-in-console-or-secrets-manager>"
+          NOTION_DATABASE_ID: "<set-in-console-or-secrets-manager>"
+
+Outputs:
+  SlackEventApiUrl:
+    Description: "Invoke URL for Slack Event Webhook"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/webhook/slack/event"
+  SlackInteractiveApiUrl:
+    Description: "Invoke URL for Slack Interactive Webhook"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/webhook/slack/interactive"

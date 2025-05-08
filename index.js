@@ -4,6 +4,15 @@ const { Client } = require("@notionhq/client"); // Import Notion Client
 const OpenAI = require("openai"); // Import OpenAI Client
 const { WebClient } = require("@slack/web-api"); // Import Slack WebClient
 const crypto = require("crypto"); // Needed for signature verification
+const {
+  getPendingInteraction,
+  putPendingInteraction,
+  updatePendingInteraction,
+  deletePendingInteraction,
+  markInteractionCompleted,
+  isInteractionCompleted,
+} = require("./dynamodb");
+const querystring = require("querystring");
 
 const app = express();
 
@@ -120,24 +129,10 @@ let issueCounter = 0;
 
 // --- Simple In-Memory State Store for Pending Interactions ---
 // WARNING: This data is lost on server restart. Use a persistent store (DB, Redis, etc.) for production.
-let pendingInteractions = {}; // Key: original_message_ts, Value: { initialParsedInfoRaw, structuredSlackMessage, missingInfo, createdAt }
+// let pendingInteractions = {}; // Key: original_message_ts, Value: { initialParsedInfoRaw, structuredSlackMessage, missingInfo, createdAt }
 const PENDING_INTERACTION_TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
-
 // Cleanup old pending interactions periodically
-setInterval(() => {
-  const now = Date.now();
-  for (const key in pendingInteractions) {
-    if (
-      now - pendingInteractions[key].createdAt >
-      PENDING_INTERACTION_TIMEOUT_MS
-    ) {
-      logger.info(
-        `[State Cleanup] Removing expired pending interaction for thread: ${key}`
-      );
-      delete pendingInteractions[key];
-    }
-  }
-}, 60 * 1000); // Check every minute
+// setInterval(() => { ... }, 60 * 1000); // REMOVE THIS
 
 // --- I. MCP Server: Tool Implementations (Mocks) ---
 // These mocks DO NOT use the actual API keys yet.
@@ -416,19 +411,25 @@ const tools_processing = {
     };
 
     if (openai) {
-      const prompt = `You are an expert issue triage assistant. Your task is to analyze a Slack message and extract structured information for creating an issue in a Notion tracker. Output a valid JSON object with the following keys:
+      const prompt = `You are an expert issue triage assistant. Your task is to analyze a Slack message and extract structured information for creating an issue in a Notion tracker. Output a valid JSON object with the following keys, using EXACTLY the spelling and casing provided below (no spaces, underscores, or alternate casing):
 
-- Title: (String) A concise summary of the main problem or request, typically 5-15 words. If a clear title cannot be derived, use "UNKNOWN_TITLE". Sentence case.
-- Description: (String) The full, verbatim text of the original Slack message. This will be used as the primary description content.
-- RootCause: (String) If the message explicitly mentions a root cause, extract it. If the user states the root cause is unknown, unclear, or similar, use "Unclear". If not mentioned at all, use "UNKNOWN_ROOT_CAUSE". If the user explicitly states "N/A", use "N/A".
-- IssueType: (String) Categorize into one of: "Bug", "Incident", "Task", "Test". If not clearly inferable from the message content, use "UNKNOWN_ISSUE_TYPE".
-- Priority: (String) Categorize into one of: "High", "Medium", "Low". If not clearly inferable, use "UNKNOWN_PRIORITY".
-- SuccessCriteria: (String) If the message specifies success criteria or definition of done, extract it. If not mentioned, use "UNKNOWN_SUCCESS_CRITERIA". If the user explicitly states "N/A", use "N/A".
-- Resolution: (String) If the message specifies a resolution or fix, extract it. If not mentioned, use "UNKNOWN_RESOLUTION". If the user explicitly states "N/A", use "N/A".
-- MentionedImageURL: (String) If the user pastes a URL to an image directly in the message text, extract that URL. Otherwise, use "NO_MENTIONED_IMAGE_URL". (Note: Actual attached files are handled separately by the system).
+Title: (String) A concise summary of the main problem or request, typically 5-15 words. If a clear title cannot be derived, use "UNKNOWN_TITLE". Sentence case.
+Description: (String) The full, verbatim text of the original Slack message. This will be used as the primary description content.
+RootCause: (String) If the message explicitly mentions a root cause, extract it. If the user states the root cause is unknown, unclear, or similar, use "Unclear". If not mentioned at all, use "UNKNOWN_ROOT_CAUSE". If the user explicitly states "N/A", use "N/A".
+IssueType: (String) Categorize into one of: "Bug", "Incident", "Task", "Test". If not clearly inferable from the message content, use "UNKNOWN_ISSUE_TYPE".
+Priority: (String) Categorize into one of: "High", "Medium", "Low". If not clearly inferable, use "UNKNOWN_PRIORITY".
+SuccessCriteria: (String) If the message specifies success criteria or definition of done, extract it. If not mentioned, use "UNKNOWN_SUCCESS_CRITERIA". If the user explicitly states "N/A", use "N/A".
+Resolution: (String) If the message specifies a resolution or fix, extract it. If not mentioned, use "UNKNOWN_RESOLUTION". If the user explicitly states "N/A", use "N/A".
+PictureURL: (String) If there is a picture or image attached, provide the URL. Otherwise, use "No picture attached".
+MentionedImageURL: (String) If the user pastes a URL to an image directly in the message text, extract that URL. Otherwise, use "NO_MENTIONED_IMAGE_URL". (Note: Actual attached files are handled separately by the system).
+originalText: (String) The original Slack message text.
 
 IMPORTANT:
-- Adhere strictly to the specified values for "UNKNOWN_*" or "NO_MENTIONED_IMAGE_URL" when information is not available or applicable. Do not invent information.
+- Use ONLY the above keys in your output JSON. Do NOT use spaces, underscores, or alternate casing in keys. For example, do NOT use "Root Cause", "root_cause", or "rootcause"—use ONLY "RootCause". The same applies for all other keys.
+- Do NOT invent information. If information is not available, use the appropriate "UNKNOWN_*" value, "N/A", or "Unclear" as specified.
+- ALWAYS include ALL keys above in your output, even if the value is "UNKNOWN_*", "N/A", or similar.
+- NEVER return extra keys or omit any of the above keys.
+- ALWAYS return a valid JSON object, not markdown or text. Do NOT use triple backticks or any markdown formatting.
 - The output MUST be a single, valid JSON object and nothing else.
 
 Examples:
@@ -442,7 +443,9 @@ Examples:
      "Priority": "High",
      "SuccessCriteria": "UNKNOWN_SUCCESS_CRITERIA",
      "Resolution": "UNKNOWN_RESOLUTION",
-     "MentionedImageURL": "NO_MENTIONED_IMAGE_URL"
+     "PictureURL": "No picture attached",
+     "MentionedImageURL": "NO_MENTIONED_IMAGE_URL",
+     "originalText": "This is a high priority issue, we can't get the valve to open up on the adsorb side of the module"
    }
 2. Slack Message: "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment. See screenshot at http://example.com/login_error.png"
    Output:
@@ -454,7 +457,9 @@ Examples:
      "Priority": "High",
      "SuccessCriteria": "Users can log in again.",
      "Resolution": "Rolled back the faulty deployment.",
-     "MentionedImageURL": "http://example.com/login_error.png"
+     "PictureURL": "No picture attached",
+     "MentionedImageURL": "http://example.com/login_error.png",
+     "originalText": "Critical: Login page down for all users. RC: Database migration failed. Success: Users can log in again. Resolution: Rolled back the faulty deployment. See screenshot at http://example.com/login_error.png"
    }
 3. Slack Message: "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now. Root cause is totally unknown."
     Output:
@@ -466,7 +471,9 @@ Examples:
       "Priority": "UNKNOWN_PRIORITY",
       "SuccessCriteria": "N/A",
       "Resolution": "Fixed by restarting the controller.",
-      "MentionedImageURL": "NO_MENTIONED_IMAGE_URL"
+      "PictureURL": "No picture attached",
+      "MentionedImageURL": "NO_MENTIONED_IMAGE_URL",
+      "originalText": "The pump is making a weird noise again. We fixed it by restarting the controller. Not sure what criteria for success would be, N/A for now. Root cause is totally unknown."
     }
 4. Slack Message: "Need to order more coffee."
     Output:
@@ -478,7 +485,9 @@ Examples:
         "Priority": "UNKNOWN_PRIORITY",
         "SuccessCriteria": "UNKNOWN_SUCCESS_CRITERIA",
         "Resolution": "UNKNOWN_RESOLUTION",
-        "MentionedImageURL": "NO_MENTIONED_IMAGE_URL"
+        "PictureURL": "No picture attached",
+        "MentionedImageURL": "NO_MENTIONED_IMAGE_URL",
+        "originalText": "Need to order more coffee."
    }
 
 Slack Message to parse:
@@ -497,20 +506,22 @@ JSON Output:
           "Parsed data from OpenAI:",
           response.choices[0].message.content
         );
-        return JSON.parse(response.choices[0].message.content);
+        return normalizeParsedInfo(
+          JSON.parse(response.choices[0].message.content)
+        );
       } catch (error) {
         logger.error(
           "[MCP TOOL ERROR: OpenAI] Failed to parse Slack message:",
           error.body || error.message
         );
         logger.warn("Falling back to basic parsing due to OpenAI error.");
-        return structuredDataFallback; // Fallback on error
+        return normalizeParsedInfo(structuredDataFallback); // Fallback on error
       }
     } else {
       logger.warn(
         "OpenAI client not initialized. Using mock/fallback parseIssueFromSlackText_tool."
       );
-      return structuredDataFallback;
+      return normalizeParsedInfo(structuredDataFallback);
     }
   },
   determineTriageCategory_tool: async ({ structuredIssueData }) => {
@@ -590,7 +601,7 @@ JSON Output:
       logger.warn(
         "OpenAI client not initialized. Cannot parse answers. Returning original data."
       );
-      return originalParsedInfo; // Cannot proceed without LLM
+      return normalizeParsedInfo(originalParsedInfo); // Cannot proceed without LLM
     }
 
     const questionList = questionsAsked
@@ -603,9 +614,7 @@ JSON Output:
 Your goal is to update the JSON object based *only* on the information the user provided in their reply *for the fields they were asked about*.
 
 Here is the original JSON data:
-\`\`\`json
 ${originalJson}
-\`\`\`
 
 The user was asked to provide information for the following fields (internal JSON key name is in parentheses):
 ${questionList} 
@@ -636,7 +645,9 @@ Output ONLY the complete, updated, valid JSON object. Do not include any other t
       );
       // Basic validation: Try parsing and check if it's an object
       const extractedJsonString = extractJson(updatedJsonString);
-      const updatedParsedInfo = JSON.parse(extractedJsonString);
+      const updatedParsedInfo = normalizeParsedInfo(
+        JSON.parse(extractedJsonString)
+      );
       if (typeof updatedParsedInfo !== "object" || updatedParsedInfo === null) {
         throw new Error("LLM did not return a valid JSON object.");
       }
@@ -647,7 +658,7 @@ Output ONLY the complete, updated, valid JSON object. Do not include any other t
         error.body || error.message
       );
       logger.warn("Returning original data due to error parsing answers.");
-      return originalParsedInfo; // Return original on error
+      return normalizeParsedInfo(originalParsedInfo); // Return original on error
     }
   },
 };
@@ -662,6 +673,70 @@ const extractJson = (text) => {
   return text.trim();
 };
 
+// --- Robust Key Normalization Utility ---
+function normalizeKey(key) {
+  // Lowercase, remove spaces, underscores, dashes, and apostrophes
+  return key.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+const CANONICAL_KEYS = {
+  title: "Title",
+  description: "Description",
+  rootcause: "RootCause",
+  rootcauses: "RootCause",
+  root_cause: "RootCause",
+  "root cause": "RootCause",
+  issuetype: "IssueType",
+  issue_type: "IssueType",
+  "issue type": "IssueType",
+  priority: "Priority",
+  successcriteria: "SuccessCriteria",
+  success_criteria: "SuccessCriteria",
+  "success criteria": "SuccessCriteria",
+  resolution: "Resolution",
+  pictureurl: "PictureURL",
+  picture_url: "PictureURL",
+  "picture url": "PictureURL",
+  mentionedimageurl: "MentionedImageURL",
+  mentioned_image_url: "MentionedImageURL",
+  "mentioned image url": "MentionedImageURL",
+  originaltext: "originalText",
+  original_text: "originalText",
+  "original text": "originalText",
+};
+
+function normalizeParsedInfo(parsed) {
+  if (!parsed) return parsed;
+  const normalized = {};
+  for (const key in parsed) {
+    const normKey = normalizeKey(key);
+    const canonicalKey = CANONICAL_KEYS[normKey] || key;
+    normalized[canonicalKey] = parsed[key];
+  }
+  return normalized;
+}
+
+// --- Flexible Adequacy Checks ---
+const ADEQUATE_VALUES = {
+  na: true,
+  n_a: true,
+  unclear: true,
+  unknown: true,
+  "n/a": true,
+  "n.a.": true,
+  "n.a": true,
+  "not applicable": true,
+};
+function isAdequateValue(value, unknownPrefix) {
+  if (!value || typeof value !== "string") return false;
+  const v = value.trim().toLowerCase();
+  if (v === "" || v.startsWith(unknownPrefix.toLowerCase())) return false;
+  if (ADEQUATE_VALUES[v]) return true;
+  return true;
+}
+
+// --- Update NOTION_PROPERTY_PROFILES to use robust isAdequate ---
+// ... existing code ...
 const NOTION_PROPERTY_PROFILES = {
   Title: {
     parsedKey: "Title",
@@ -673,33 +748,31 @@ const NOTION_PROPERTY_PROFILES = {
   IssueType: {
     parsedKey: "IssueType",
     displayName: "Issue Type",
-    isAdequate: (value) => value && !value.startsWith("UNKNOWN_"), // Will be one of Bug, Task, Incident, Test
+    isAdequate: (value) => isAdequateValue(value, "UNKNOWN_ISSUE_TYPE"),
     question: "What type of issue is this? (e.g., Bug, Task, Incident, Test)",
   },
   Priority: {
     parsedKey: "Priority",
     displayName: "Priority",
-    isAdequate: (value) => value && !value.startsWith("UNKNOWN_"), // Will be one of High, Medium, Low
+    isAdequate: (value) => isAdequateValue(value, "UNKNOWN_PRIORITY"),
     question: "What is the priority for this? (High, Medium, or Low)",
   },
   SuccessCriteria: {
     parsedKey: "SuccessCriteria",
     displayName: "Success Criteria",
-    // Consider adequate if user explicitly said N/A, or if it's filled. Ask if LLM is unsure (UNKNOWN_).
-    isAdequate: (value) => value && value !== "UNKNOWN_SUCCESS_CRITERIA",
+    isAdequate: (value) => isAdequateValue(value, "UNKNOWN_SUCCESS_CRITERIA"),
     question:
       "What are the success criteria for resolving this? (If none, say 'N/A')",
   },
-  // Example of how you might add Root Cause if you wanted to prompt for it
   RootCause: {
     parsedKey: "RootCause",
     displayName: "Root Cause",
-    // Ask if the LLM couldn't determine it (UNKNOWN_). Allow "Unclear" or "N/A" as valid answers.
-    isAdequate: (value) => value && value !== "UNKNOWN_ROOT_CAUSE",
+    isAdequate: (value) => isAdequateValue(value, "UNKNOWN_ROOT_CAUSE"),
     question:
       "What is the suspected root cause? (If unknown, okay to say 'Unknown' or 'N/A')",
   },
 };
+// ... existing code ...
 
 // --- MCP Server: Exposing Tools via API Endpoints (Example) ---
 app.post("/tools/slack/postReply", async (req, res) => {
@@ -780,28 +853,28 @@ app.post("/webhook/slack/event", async (req, res) => {
     res.status(200).json({ message: "Event received, processing..." });
 
     // --- Check if this message is part of an ongoing interaction context ---
-    if (pendingInteractions[contextIdentifier]) {
-      const interactionState = pendingInteractions[contextIdentifier];
+    let interactionState;
+    try {
+      interactionState = await getPendingInteraction(contextIdentifier);
+    } catch (err) {
+      logger.error(`[DynamoDB] Error fetching pending interaction:`, err);
+      interactionState = null;
+    }
+    if (interactionState) {
       logger.info(
         `[MCP CLIENT LOG] Received reply for tracked context: ${contextIdentifier}`
       );
-
       try {
         const userReplyText = messagePayload.text;
         logger.info(
           `[MCP CLIENT LOG] Processing reply: "${userReplyText}" for context ${contextIdentifier}`
         );
-
-        // Update the parsed info with the user's new answers
-        const originalDataBeforeUpdate = interactionState.initialParsedInfoRaw; // Store ref before call
-        const updatedData = // Use a temp var for the returned data
-          await tools_processing.parseAnswersAndUpdate_tool({
-            userReplyText: userReplyText,
-            originalParsedInfo: originalDataBeforeUpdate,
-            questionsAsked: interactionState.missingInfo,
-          });
-
-        // Check if the LLM tool failed (returned the exact same object reference)
+        const originalDataBeforeUpdate = interactionState.initialParsedInfoRaw;
+        const updatedData = await tools_processing.parseAnswersAndUpdate_tool({
+          userReplyText: userReplyText,
+          originalParsedInfo: originalDataBeforeUpdate,
+          questionsAsked: interactionState.missingInfo,
+        });
         if (
           updatedData === originalDataBeforeUpdate &&
           userReplyText.trim() !== ""
@@ -809,36 +882,42 @@ app.post("/webhook/slack/event", async (req, res) => {
           logger.warn(
             `[MCP CLIENT LOG] parseAnswersAndUpdate_tool returned original data for context ${contextIdentifier}. User reply might not have been processed due to LLM error.`
           );
-          // Inform user and wait for another reply, don't change state or re-ask.
           await tools_slack.postSlackReply_tool({
             channelId: messagePayload.channel,
             messageText:
               ":warning: I had trouble processing your last reply. Could you please try rephrasing or ensure it directly answers the questions I asked?",
             threadTimestamp: contextIdentifier,
           });
-          return; // Stop processing this reply, wait for user to try again.
+          return;
         }
-
-        // If processing seemed successful, update the state
         interactionState.initialParsedInfoRaw = updatedData;
-
+        logger.info(
+          "[DEBUG] Updated parsed info after reply:",
+          interactionState.initialParsedInfoRaw
+        );
         logger.info(
           `[MCP CLIENT LOG] Step 2 Updated (Reply Path for context ${contextIdentifier}): Parsed Issue Info (Raw) after reply:`,
           interactionState.initialParsedInfoRaw
         );
-
-        // Re-evaluate what's missing
         let stillMissingInfo = [];
         for (const profileName in NOTION_PROPERTY_PROFILES) {
           const profile = NOTION_PROPERTY_PROFILES[profileName];
           const value =
             interactionState.initialParsedInfoRaw[profile.parsedKey];
+          logger.info(
+            `[DEBUG] Checking field '${
+              profile.parsedKey
+            }': value='${value}' isAdequate=${profile.isAdequate(value)}`
+          );
           if (!profile.isAdequate(value)) {
             stillMissingInfo.push(profile);
           }
         }
+        logger.info(
+          "[DEBUG] Missing info after reply:",
+          stillMissingInfo.map((p) => p.parsedKey)
+        );
         interactionState.missingInfo = stillMissingInfo;
-
         if (interactionState.missingInfo.length > 0) {
           logger.info(
             `[MCP CLIENT LOG] Context ${contextIdentifier}: Still missing info, asking again:`,
@@ -847,9 +926,16 @@ app.post("/webhook/slack/event", async (req, res) => {
               question: p.question,
             }))
           );
-          interactionState.createdAt = Date.now(); // Update timestamp
-          pendingInteractions[contextIdentifier] = interactionState; // Re-store updated state
-
+          interactionState.createdAt = Date.now();
+          try {
+            await putPendingInteraction(
+              contextIdentifier,
+              interactionState,
+              PENDING_INTERACTION_TIMEOUT_MS / 1000
+            );
+          } catch (err) {
+            logger.error(`[DynamoDB] Error updating pending interaction:`, err);
+          }
           const blocks = buildMissingInfoBlocks(
             interactionState.missingInfo,
             interactionState.initialParsedInfoRaw
@@ -858,24 +944,21 @@ app.post("/webhook/slack/event", async (req, res) => {
             channelId: messagePayload.channel,
             messageText: "Thanks for the update! Still need a bit more info:",
             blocks: blocks,
-            threadTimestamp: contextIdentifier, // Reply in the same context thread
+            threadTimestamp: contextIdentifier,
           });
           logger.info(
             `[MCP CLIENT LOG] Re-asked for info in context ${contextIdentifier}.`
           );
         } else {
-          // All info gathered, proceed to Notion
           logger.info(
             `[MCP CLIENT LOG] All info gathered for context ${contextIdentifier} via reply. Proceeding to Notion.`
           );
-          // Pass the contextIdentifier for proper cleanup
           await processAndCreateNotionPage(
             interactionState.initialParsedInfoRaw,
-            interactionState.structuredSlackMessage, // Contains original message permalink, specific ts
+            interactionState.structuredSlackMessage,
             interactionState,
-            contextIdentifier // Pass the key for cleanup
+            contextIdentifier
           );
-          // processAndCreateNotionPage handles cleanup of pendingInteractions[contextIdentifier]
         }
       } catch (error) {
         logger.error(
@@ -895,14 +978,13 @@ app.post("/webhook/slack/event", async (req, res) => {
           );
         }
       }
-      return; // Handled as part of an ongoing interaction
+      return;
     }
 
     // --- If not a reply to a tracked interaction context, process as a new potential issue ---
     logger.info(
       `[MCP CLIENT LOG] Context ${contextIdentifier} not found in pending interactions. Processing as new.`
     );
-
     try {
       // Step 1: Structure incoming Slack message (get permalink, etc.)
       // Note: structuredSlackMessage.timestamp will be messagePayload.ts
@@ -950,29 +1032,35 @@ app.post("/webhook/slack/event", async (req, res) => {
           }))
         );
 
-        // Store state for this interaction, keyed by the contextIdentifier
-        pendingInteractions[contextIdentifier] = {
+        const interactionState = {
           initialParsedInfoRaw: parsedIssueInfoRaw,
-          structuredSlackMessage: structuredSlackMessage, // Holds specific .ts for permalink
+          structuredSlackMessage: structuredSlackMessage,
           missingInfo: missingInfo,
           createdAt: Date.now(),
         };
+        try {
+          await putPendingInteraction(
+            contextIdentifier,
+            interactionState,
+            PENDING_INTERACTION_TIMEOUT_MS / 1000
+          );
+        } catch (err) {
+          logger.error(`[DynamoDB] Error putting pending interaction:`, err);
+        }
         logger.info(
           `[State Store] Stored pending interaction for context: ${contextIdentifier}`
         );
-
         const blocks = buildMissingInfoBlocks(missingInfo, parsedIssueInfoRaw);
         await tools_slack.postSlackReply_tool({
           channelId: structuredSlackMessage.channelId,
           messageText:
             "Thanks for reporting this! To log it accurately in Notion, could you please clarify a few things?",
           blocks: blocks,
-          threadTimestamp: contextIdentifier, // Reply in the context thread
+          threadTimestamp: contextIdentifier,
         });
         logger.info(
           `[MCP CLIENT LOG] Asked clarifying questions in context ${contextIdentifier}. Waiting for reply/interaction.`
         );
-        // res.status(200).json({ message: "Asking user for clarification." }); // Already sent
         return;
       }
 
@@ -987,7 +1075,6 @@ app.post("/webhook/slack/event", async (req, res) => {
         null,
         null
       );
-      // res.status(200).json({ /* ... */ }); // Already sent
     } catch (error) {
       logger.error("[MCP CLIENT ERROR] Orchestration failed:", error);
       try {
@@ -1003,7 +1090,6 @@ app.post("/webhook/slack/event", async (req, res) => {
           slackError
         );
       }
-      // res.status(500).json({ success: false, error: error.message }); // Already sent 200
     }
   } else if (slackEventPayload.challenge) {
     // This case is handled by the url_verification check at the top,
@@ -1159,7 +1245,8 @@ async function processAndCreateNotionPage(
   parsedInfoRaw,
   structuredSlackMessage,
   interactionState = null, // The full state object, if processing from a pending interaction
-  interactionContextKey = null // The key used for pendingInteractions (e.g., thread_ts or original message_ts)
+  interactionContextKey = null, // The key used for pendingInteractions (e.g., thread_ts or original message_ts)
+  logger // Added logger parameter
 ) {
   // Use interactionContextKey if available (it's the true context of the conversation),
   // otherwise fallback to structuredSlackMessage.timestamp (ts of the specific message being processed directly)
@@ -1356,20 +1443,34 @@ async function processAndCreateNotionPage(
       );
     }
   } finally {
-    // --- Cleanup State (if called from interaction) ---
     if (interactionState && interactionContextKey) {
       logger.info(
         `[State Cleanup] Removing completed/failed interaction for context: ${interactionContextKey}`
       );
-      delete pendingInteractions[interactionContextKey];
+      try {
+        await deletePendingInteraction(interactionContextKey, logger); // Pass logger
+        await markInteractionCompleted(interactionContextKey, logger); // Mark as completed
+      } catch (err) {
+        logger.error(
+          `[DynamoDB] Error deleting or marking completed interaction:`,
+          err
+        );
+      }
     } else if (interactionState) {
-      // This case should ideally not be hit if interactionContextKey is always passed with interactionState
       const fallbackCleanupKey =
         structuredSlackMessage.thread_ts || structuredSlackMessage.timestamp;
       logger.warn(
         `[State Cleanup] Interaction state provided for cleanup, but interactionContextKey was missing. Using fallback key for cleanup: ${fallbackCleanupKey} (structuredSlackMessage.timestamp was ${structuredSlackMessage.timestamp})`
       );
-      delete pendingInteractions[fallbackCleanupKey];
+      try {
+        await deletePendingInteraction(fallbackCleanupKey, logger); // Pass logger and corrected variable name
+        await markInteractionCompleted(fallbackCleanupKey, logger); // Mark as completed
+      } catch (err) {
+        logger.error(
+          `[DynamoDB] Error deleting or marking completed interaction:`,
+          err
+        );
+      }
     }
   }
 }
@@ -1516,7 +1617,13 @@ app.post(
         return;
       }
 
-      const interactionState = pendingInteractions[contextIdentifier];
+      let interactionState;
+      try {
+        interactionState = await getPendingInteraction(contextIdentifier);
+      } catch (err) {
+        logger.error(`[DynamoDB] Error fetching pending interaction:`, err);
+        interactionState = null;
+      }
       if (!interactionState) {
         logger.warn(
           `[Interaction] Interaction state not found or expired for context: ${contextIdentifier}. Action ID: ${action.action_id}`
@@ -1592,7 +1699,15 @@ app.post(
       );
 
       interactionState.createdAt = Date.now(); // Touch the interaction
-      pendingInteractions[contextIdentifier] = interactionState; // Store updated state
+      try {
+        await putPendingInteraction(
+          contextIdentifier,
+          interactionState,
+          PENDING_INTERACTION_TIMEOUT_MS / 1000
+        );
+      } catch (err) {
+        logger.error(`[DynamoDB] Error updating pending interaction:`, err);
+      }
 
       // Check if any fields *requiring text replies* are still in missingInfo
       const needsTextReply = interactionState.missingInfo.some(
@@ -1628,11 +1743,10 @@ app.post(
         interactionState.initialParsedInfoRaw,
         interactionState.structuredSlackMessage,
         interactionState,
-        contextIdentifier // Pass the key for cleanup
+        contextIdentifier,
+        logger // Pass logger
       );
-      // processAndCreateNotionPage handles cleanup of pendingInteractions[contextIdentifier]
     } else if (payload.type === "view_submission") {
-      // Handle modal submissions if you add them later
       logger.info("[Interaction] Received view_submission (modal submitted).");
       // Implement modal submission logic here
     } else {
@@ -1650,19 +1764,493 @@ app.get("/", (req, res) => {
   );
 });
 
-app.listen(PORT, () => {
-  logger.info(`MCP Demo App listening on port ${PORT}`);
-  logger.info(`LOG_LEVEL is set to: ${LOG_LEVEL}`);
-  logger.info(`Using Notion Database ID: ${NOTION_DATABASE_ID}`);
-  logger.info(
-    "To test, send a POST request to http://localhost:${PORT}/webhook/slack/event with a JSON body like the example in README.md"
-  );
-});
-
 // Helper function to normalize Slack permalinks by removing query parameters
 const canonicalizeSlackPermalink = (permalink) => {
   if (typeof permalink !== "string") {
     return permalink; // Or handle error appropriately
   }
   return permalink.split("?")[0];
+};
+
+// Helper: Parse JSON safely
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
+
+// Helper: Parse urlencoded body
+function parseUrlEncoded(body) {
+  return querystring.parse(body);
+}
+
+// Helper: Lambda-style Slack signature verification
+function verifySlackSignatureLambda(event, rawBody) {
+  if (!SLACK_SIGNING_SECRET) {
+    logger.warn(
+      "[Security] SLACK_SIGNING_SECRET not set. Skipping verification."
+    );
+    return true; // Skip if not set
+  }
+  const slackSignature =
+    event.headers["x-slack-signature"] || event.headers["X-Slack-Signature"];
+  const timestamp =
+    event.headers["x-slack-request-timestamp"] ||
+    event.headers["X-Slack-Request-Timestamp"];
+  if (!slackSignature || !timestamp) {
+    logger.warn(
+      "[Security] Missing signature or timestamp headers for Slack verification."
+    );
+    return false;
+  }
+  const fiveMinutesAgo = Date.now() / 1000 - 60 * 5;
+  if (timestamp < fiveMinutesAgo) {
+    logger.warn("[Security] Slack request timestamp expired.");
+    return false;
+  }
+  const hmac = crypto.createHmac("sha256", SLACK_SIGNING_SECRET);
+  const sig_basestring = "v0:" + timestamp + ":" + rawBody;
+  hmac.update(sig_basestring);
+  const computedSignature = "v0=" + hmac.digest("hex");
+  try {
+    const valid = crypto.timingSafeEqual(
+      Buffer.from(computedSignature, "utf8"),
+      Buffer.from(slackSignature, "utf8")
+    );
+    return crypto.timingSafeEqual(
+      Buffer.from(computedSignature, "utf8"),
+      Buffer.from(slackSignature, "utf8")
+    );
+  } catch {
+    return false;
+  }
+}
+
+// Lambda Handler: Slack Event Webhook
+async function slackEventHandler(event, context) {
+  let body = event.body;
+  if (event.isBase64Encoded) body = Buffer.from(body, "base64").toString();
+  const payload = safeJsonParse(body);
+  if (!payload || typeof payload !== "object") {
+    return { statusCode: 400, body: "Invalid payload." };
+  }
+  // Slack URL Verification
+  if (payload.type === "url_verification") {
+    return { statusCode: 200, body: payload.challenge };
+  }
+  // Only handle event_callback with message
+  if (
+    payload.type === "event_callback" &&
+    payload.event &&
+    payload.event.type === "message"
+  ) {
+    // Ignore bot messages, edits, deletions
+    if (
+      payload.event.bot_id ||
+      payload.event.subtype === "bot_message" ||
+      payload.event.subtype === "message_changed" ||
+      payload.event.subtype === "message_deleted"
+    ) {
+      return { statusCode: 200, body: "Ignoring event due to subtype." };
+    }
+    const messagePayload = payload.event;
+    const contextIdentifier = String(
+      messagePayload.thread_ts || messagePayload.ts
+    ); // Ensure string
+    // Check if this thread is already completed
+    try {
+      const completed = await isInteractionCompleted(contextIdentifier, logger);
+      if (completed) {
+        logger.info(
+          `[MCP CLIENT LOG] Context ${contextIdentifier} already completed. Not starting new workflow.`
+        );
+        await tools_slack.postSlackReply_tool({
+          channelId: messagePayload.channel,
+          messageText:
+            ":information_source: This issue has already been logged for this thread. If you have a new issue, please start a new thread.",
+          threadTimestamp: contextIdentifier,
+        });
+        return { statusCode: 200, body: "Thread already completed." };
+      }
+    } catch (err) {
+      logger.error(`[DynamoDB] Error checking completed marker:`, err);
+      // Fail open: allow workflow to proceed if check fails
+    }
+    // --- Check if this message is part of an ongoing interaction context ---
+    let interactionState;
+    try {
+      interactionState = await getPendingInteraction(contextIdentifier, logger); // Pass logger
+    } catch (err) {
+      logger.error(`[DynamoDB] Error fetching pending interaction:`, err);
+      interactionState = null;
+    }
+    if (interactionState) {
+      logger.info(
+        `[MCP CLIENT LOG] Received reply for tracked context: ${contextIdentifier}`
+      );
+      try {
+        const userReplyText = messagePayload.text;
+        logger.info(
+          `[MCP CLIENT LOG] Processing reply: "${userReplyText}" for context ${contextIdentifier}`
+        );
+        const originalDataBeforeUpdate = interactionState.initialParsedInfoRaw;
+        const updatedData = await tools_processing.parseAnswersAndUpdate_tool({
+          userReplyText: userReplyText,
+          originalParsedInfo: originalDataBeforeUpdate,
+          questionsAsked: interactionState.missingInfo,
+        });
+        if (
+          updatedData === originalDataBeforeUpdate &&
+          userReplyText.trim() !== ""
+        ) {
+          logger.warn(
+            `[MCP CLIENT LOG] parseAnswersAndUpdate_tool returned original data for context ${contextIdentifier}. User reply might not have been processed due to LLM error.`
+          );
+          await tools_slack.postSlackReply_tool({
+            channelId: messagePayload.channel,
+            messageText:
+              ":warning: I had trouble processing your last reply. Could you please try rephrasing or ensure it directly answers the questions I asked?",
+            threadTimestamp: contextIdentifier,
+          });
+          return; // Return within Lambda: use object like { statusCode: 200, body: "..." }
+        }
+        interactionState.initialParsedInfoRaw = updatedData;
+        logger.info(
+          "[DEBUG] Updated parsed info after reply:",
+          interactionState.initialParsedInfoRaw
+        );
+        logger.info(
+          `[MCP CLIENT LOG] Step 2 Updated (Reply Path for context ${contextIdentifier}): Parsed Issue Info (Raw) after reply:`,
+          interactionState.initialParsedInfoRaw
+        );
+        let stillMissingInfo = [];
+        for (const profileName in NOTION_PROPERTY_PROFILES) {
+          const profile = NOTION_PROPERTY_PROFILES[profileName];
+          const value =
+            interactionState.initialParsedInfoRaw[profile.parsedKey];
+          logger.info(
+            `[DEBUG] Checking field '${
+              profile.parsedKey
+            }': value='${value}' isAdequate=${profile.isAdequate(value)}`
+          );
+          if (!profile.isAdequate(value)) {
+            stillMissingInfo.push(profile);
+          }
+        }
+        logger.info(
+          "[DEBUG] Missing info after reply:",
+          stillMissingInfo.map((p) => p.parsedKey)
+        );
+        interactionState.missingInfo = stillMissingInfo;
+        if (interactionState.missingInfo.length > 0) {
+          logger.info(
+            `[MCP CLIENT LOG] Context ${contextIdentifier}: Still missing info, asking again:`,
+            interactionState.missingInfo.map((p) => ({
+              field: p.displayName,
+              question: p.question,
+            }))
+          );
+          interactionState.createdAt = Date.now();
+          try {
+            await putPendingInteraction(
+              contextIdentifier,
+              interactionState,
+              PENDING_INTERACTION_TIMEOUT_MS / 1000,
+              logger // Pass logger
+            );
+          } catch (err) {
+            logger.error(`[DynamoDB] Error updating pending interaction:`, err);
+          }
+          const blocks = buildMissingInfoBlocks(
+            interactionState.missingInfo,
+            interactionState.initialParsedInfoRaw
+          );
+          await tools_slack.postSlackReply_tool({
+            channelId: messagePayload.channel,
+            messageText: "Thanks for the update! Still need a bit more info:",
+            blocks: blocks,
+            threadTimestamp: contextIdentifier,
+          });
+          logger.info(
+            `[MCP CLIENT LOG] Re-asked for info in context ${contextIdentifier}.`
+          );
+        } else {
+          logger.info(
+            `[MCP CLIENT LOG] All info gathered for context ${contextIdentifier} via reply. Proceeding to Notion.`
+          );
+          await processAndCreateNotionPage(
+            interactionState.initialParsedInfoRaw,
+            interactionState.structuredSlackMessage,
+            interactionState,
+            contextIdentifier,
+            logger // Pass logger
+          );
+        }
+      } catch (error) {
+        logger.error(
+          `[MCP CLIENT ERROR] Failed to process user reply for context ${contextIdentifier}:`,
+          error
+        );
+        try {
+          await tools_slack.postSlackReply_tool({
+            channelId: messagePayload.channel,
+            messageText: `:x: Sorry, I encountered an error trying to process your reply: ${error.message}`,
+            threadTimestamp: contextIdentifier,
+          });
+        } catch (slackError) {
+          logger.error(
+            `Failed to send error reply to slack about reply processing failure for context ${contextIdentifier}`,
+            slackError
+          );
+        }
+      }
+      return { statusCode: 200, body: "Handled reply in thread." };
+    }
+    // --- If not a reply, process as new ---
+    try {
+      const structuredSlackMessage =
+        await tools_slack.receiveSlackIssueMessage_tool({
+          user: messagePayload.user,
+          text: messagePayload.text,
+          channel: messagePayload.channel,
+          ts: messagePayload.ts,
+          attachments: messagePayload.files || [],
+        });
+      const parsedIssueInfoRaw =
+        await tools_processing.parseIssueFromSlackText_tool({
+          rawSlackText: structuredSlackMessage.text,
+          attachments: structuredSlackMessage.attachments,
+        });
+      let missingInfo = [];
+      for (const profileName in NOTION_PROPERTY_PROFILES) {
+        const profile = NOTION_PROPERTY_PROFILES[profileName];
+        const value = parsedIssueInfoRaw[profile.parsedKey];
+        if (!profile.isAdequate(value)) {
+          missingInfo.push(profile);
+        }
+      }
+      if (missingInfo.length > 0) {
+        const interactionState = {
+          initialParsedInfoRaw: parsedIssueInfoRaw,
+          structuredSlackMessage: structuredSlackMessage,
+          missingInfo: missingInfo,
+          createdAt: Date.now(),
+        };
+        try {
+          await putPendingInteraction(
+            contextIdentifier,
+            interactionState,
+            PENDING_INTERACTION_TIMEOUT_MS / 1000,
+            logger // Pass logger
+          );
+        } catch (err) {
+          logger.error(`[DynamoDB] Error putting pending interaction:`, err);
+        }
+        const blocks = buildMissingInfoBlocks(missingInfo, parsedIssueInfoRaw);
+        await tools_slack.postSlackReply_tool({
+          channelId: structuredSlackMessage.channelId,
+          messageText:
+            "Thanks for reporting this! To log it accurately in Notion, could you please clarify a few things?",
+          blocks: blocks,
+          threadTimestamp: contextIdentifier,
+        });
+        return { statusCode: 200, body: "Asked for clarification." };
+      }
+      await processAndCreateNotionPage(
+        parsedIssueInfoRaw,
+        structuredSlackMessage,
+        null,
+        null,
+        logger // Pass logger
+      );
+      return { statusCode: 200, body: "Created Notion issue." };
+    } catch (error) {
+      logger.error("[MCP CLIENT ERROR] Orchestration failed:", error);
+      try {
+        await tools_slack.postSlackReply_tool({
+          channelId: messagePayload.channel,
+          messageText: `:x: Error processing issue: ${error.message}`,
+          threadTimestamp: contextIdentifier,
+        });
+      } catch (slackError) {
+        logger.error(
+          `Failed to send error reply to slack for context ${contextIdentifier}`,
+          slackError
+        );
+      }
+      return { statusCode: 500, body: "Error processing issue." };
+    }
+  }
+  return { statusCode: 200, body: "Event type not handled." };
+}
+
+// Lambda Handler: Slack Interactive Webhook
+async function slackInteractiveHandler(event, context) {
+  let rawBody = event.body;
+  if (event.isBase64Encoded)
+    rawBody = Buffer.from(rawBody, "base64").toString();
+  // Verify Slack signature
+  if (!verifySlackSignatureLambda(event, rawBody)) {
+    return { statusCode: 400, body: "Signature verification failed" };
+  }
+  // Parse urlencoded body
+  const parsed = parseUrlEncoded(rawBody);
+  let payload;
+  try {
+    payload = JSON.parse(parsed.payload);
+  } catch (e) {
+    logger.error("[Interaction] Error parsing Slack payload:", e);
+    return { statusCode: 200, body: "" }; // Acknowledge Slack
+  }
+  // Acknowledge Slack immediately - This response is what Slack expects.
+  // Do not return other {statusCode, body} from further logic in this handler path for block_actions.
+  // If we need to send a message to Slack as a result of an action, it must be done via a Slack API call (e.g. postSlackReply_tool or response_url).
+
+  // Handle Block Actions
+  if (
+    payload.type === "block_actions" &&
+    payload.actions &&
+    payload.actions.length > 0
+  ) {
+    const action = payload.actions[0];
+    const contextIdentifierRaw =
+      payload.container?.thread_ts || payload.message?.ts;
+
+    if (!contextIdentifierRaw) {
+      logger.warn(
+        "[Interaction] Block action without thread_ts/message_ts. Cannot identify context."
+      );
+      return { statusCode: 200, body: "" }; // Acknowledge Slack
+    }
+    const contextIdentifier = String(contextIdentifierRaw); // Ensure contextIdentifier is a string
+
+    logger.info(
+      `[Lambda Interactive Handler] Processing action '${action.action_id}' for context ${contextIdentifier}`
+    );
+    let interactionState;
+    try {
+      interactionState = await getPendingInteraction(contextIdentifier, logger); // Pass logger
+    } catch (err) {
+      logger.error(`[DynamoDB] Error fetching pending interaction:`, err);
+      interactionState = null;
+    }
+    if (!interactionState) {
+      logger.warn(
+        `[Interaction] Interaction state not found for context ${contextIdentifier}. Action ID: ${action.action_id}`
+      );
+      if (payload.channel?.id && payload.message?.ts) {
+        try {
+          await tools_slack.postSlackReply_tool({
+            channelId: payload.channel.id,
+            messageText:
+              ":warning: Sorry, this set of questions/buttons has expired. If you were in the middle of reporting an issue, please send your issue details again to start over.",
+            threadTimestamp: payload.message.ts,
+          });
+        } catch (slackError) {
+          logger.error(
+            `[Interaction] Failed to send expiry message to Slack for context ${contextIdentifier}:`,
+            slackError
+          );
+        }
+      }
+      return { statusCode: 200, body: "" }; // Acknowledge Slack
+    }
+    let fieldUpdated = false;
+    const value = action.selected_option?.value || action.value;
+    if (action.action_id === "select_priority" && value) {
+      interactionState.initialParsedInfoRaw.Priority = value;
+      fieldUpdated = true;
+    } else if (action.action_id === "select_issue_type" && value) {
+      interactionState.initialParsedInfoRaw.IssueType = value;
+      fieldUpdated = true;
+    }
+    // Add more else if blocks here for other interactive elements if any
+
+    if (fieldUpdated) {
+      logger.info(
+        `[Interaction] Context ${contextIdentifier}: Updated interaction state from button/select:`,
+        interactionState.initialParsedInfoRaw
+      );
+    } else {
+      logger.warn(
+        `[Interaction] Context ${contextIdentifier}: Unhandled action_id: ${action.action_id}. No state updated.`
+      );
+      // It's important to still acknowledge Slack even if the action isn't one we specifically handle to update state.
+      // The user clicked something, Slack expects a 200 OK.
+      return { statusCode: 200, body: "" }; // Acknowledge Slack
+    }
+
+    interactionState.missingInfo = interactionState.missingInfo.filter(
+      (profile) =>
+        !(
+          profile.parsedKey === "Priority" &&
+          action.action_id === "select_priority"
+        ) &&
+        !(
+          profile.parsedKey === "IssueType" &&
+          action.action_id === "select_issue_type"
+        )
+      // Add checks for other action_ids if they directly map to a missingInfo profile
+    );
+    interactionState.createdAt = Date.now();
+    try {
+      await putPendingInteraction(
+        contextIdentifier,
+        interactionState,
+        PENDING_INTERACTION_TIMEOUT_MS / 1000,
+        logger // Pass logger
+      );
+    } catch (err) {
+      logger.error(`[DynamoDB] Error updating pending interaction:`, err);
+      // Even if DB update fails, acknowledge Slack. We might log an error message to the thread if possible.
+      // Consider sending an error message to the user in Slack here.
+      return { statusCode: 200, body: "" }; // Acknowledge Slack
+    }
+    const needsTextReply = interactionState.missingInfo.some(
+      (p) =>
+        p.parsedKey === "SuccessCriteria" ||
+        p.parsedKey === "RootCause" ||
+        p.parsedKey === "Title" ||
+        p.parsedKey === "Description"
+      // Add other fields that are expected via text reply, not buttons
+    );
+    if (needsTextReply) {
+      logger.info(
+        `[Interaction] Context ${contextIdentifier} updated by button/select, but still waiting for text replies for other fields. Missing:`,
+        interactionState.missingInfo.map((m) => m.displayName)
+      );
+      // Acknowledge Slack. The bot will re-ask on the next text message if info is still missing.
+      return { statusCode: 200, body: "" };
+    }
+    // If we get here, all info gathered. Proceed to Notion.
+    logger.info(
+      `[Interaction] All information gathered for context ${contextIdentifier} via interactions/replies. Proceeding to Notion.`
+    );
+    await processAndCreateNotionPage(
+      interactionState.initialParsedInfoRaw,
+      interactionState.structuredSlackMessage,
+      interactionState,
+      contextIdentifier,
+      logger // Pass logger
+    );
+    return { statusCode: 200, body: "" }; // Acknowledge Slack
+  } else if (payload.type === "view_submission") {
+    logger.info("[Interaction] Received view_submission (modal submitted).");
+    // Implement modal submission logic here
+    return { statusCode: 200, body: "" }; // Acknowledge Slack
+  } else {
+    logger.warn(
+      "[Interaction] Received unhandled payload type or empty actions:",
+      payload.type
+    );
+    return { statusCode: 200, body: "" };
+  }
+}
+
+// Export Lambda handlers
+module.exports = {
+  slackEventHandler,
+  slackInteractiveHandler,
 };
