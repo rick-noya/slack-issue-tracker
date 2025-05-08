@@ -1105,9 +1105,7 @@ app.post("/webhook/slack/event", async (req, res) => {
     try {
       // ... Step 1: Structure incoming Slack message ...
       const structuredSlackMessage =
-        await tools_slack.receiveSlackIssueMessage_tool({
-          /* ... */
-        });
+        await tools_slack.receiveSlackIssueMessage_tool(messagePayload);
       logger.info(
         "[MCP CLIENT LOG] Step 1: Structured Slack Message:",
         structuredSlackMessage
@@ -1116,7 +1114,8 @@ app.post("/webhook/slack/event", async (req, res) => {
       // ... Step 2: Parse issue info ...
       const parsedIssueInfoRaw =
         await tools_processing.parseIssueFromSlackText_tool({
-          /* ... */
+          rawSlackText: messagePayload.text,
+          attachments: messagePayload.attachments,
         });
       logger.info(
         "[MCP CLIENT LOG] Step 2: Initial Parsed Issue Info (Raw):",
